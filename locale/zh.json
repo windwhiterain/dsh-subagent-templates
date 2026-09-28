@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "子 agent 模板",
+    "description": "按命名模板派出子 agent：模板固定模型、agent preset 与 persona，父 agent 只选模板名。"
+  }
+}

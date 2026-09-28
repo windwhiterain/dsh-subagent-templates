@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Subagent Templates",
+    "description": "Delegates to a subagent built from a named template that fixes its model, agent preset, and persona."
+  }
+}

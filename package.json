@@ -1,0 +1,61 @@
+{
+  "name": "dsh-subagent-templates",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Named subagent templates: each template fixes a model, an agent preset, and an optional persona, so a delegating agent picks a template by name instead of configuring provider, model, and reasoning effort per call, and a background template child's output is delivered to its parent without a collection call.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "subagent",
+    "delegation",
+    "template"
+  ],
+  "license": "MIT",
+  "author": "windwhiterain",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/windwhiterain/dsh-subagent-templates.git"
+  },
+  "homepage": "https://github.com/windwhiterain/dsh-subagent-templates#readme",
+  "bugs": {
+    "url": "https://github.com/windwhiterain/dsh-subagent-templates/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "probe",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  },
+  "meta": {
+    "title": "Subagent Templates",
+    "description": "Delegates to a subagent built from a named template that fixes its model, agent preset, and persona."
+  }
+}

@@ -1,0 +1,37 @@
+# dsh-subagent-templates bundle patch: inserts the delegation row.
+#
+# The two templates below are a working starting point, not a recommendation:
+# each fixes a provider/model pair your deployment's LLM registry already serves,
+# and pins both to the `personal` agent preset. Edit them in the profile's own
+# `cordis.patch.yml` (which is live-reloaded) rather than here: this bundle layer
+# is re-read on every profile recomposition instead of watched, so an edit applies
+# at the next one, and a recomposition that changes this row's `config` restarts
+# the row. An id-targeted override replaces the whole `config` object.
+#
+# The row registers the `subagent` tool and `list_subagent_templates`. A preset
+# that mounts `@deepseek-ai/dsh-tool-subagent` with the same tool name keeps its
+# own tool (a nearer scope wins), so swap that row out of the preset to use this
+# one. A delegated call creates an ordinary root Session, so the child keeps the
+# model picker and the full session surface.
+- insert:
+    - id: subagent-templates
+      name: "dsh-subagent-templates"
+      config:
+        toolName: subagent
+        templates:
+          - id: medium
+            name: Medium
+            description: >-
+              coding, implement, explore, investigate.
+            provider: minimax-cn
+            model: MiniMax-M3.1-Flash-Preview
+            preset: personal
+            reasoningEffort: max
+          - id: high
+            name: High
+            description: >-
+              advice, review, discussion. (not for coding!)
+            provider: qwen
+            model: qwen3.8-max
+            preset: personal
+            reasoningEffort: high
