@@ -39,6 +39,12 @@
  * whose inherited-context child would be a second kind of object with a second
  * lifecycle.
  *
+ * Delegation is capped the way the Harness caps its own subagents:
+ * `maxActiveSubagents` bounds how many children a session has working at once,
+ * and `maxDepth` bounds how deep delegation nests. Both read this plugin's
+ * mapping store, since a template child carries no `parentSession` header for
+ * the Harness to count from.
+ *
  * This plugin imports no Harness package: out-of-tree bundles resolve from the
  * profile, which does not put the Harness's own modules on this package's
  * resolution path. `./lib/harness.ts` holds the replicated Harness behavior.
@@ -230,6 +236,7 @@ export async function apply(ctx, rawConfig) {
       onDelegated: adoptChildTools,
       registerChild,
       maxDepth: config.maxDepth,
+      maxActiveSubagents: config.maxActiveSubagents,
     })),
     `${name}.tool`,
   )

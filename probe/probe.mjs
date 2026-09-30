@@ -244,6 +244,26 @@ function harness(options = {}) {
   }
   const store = { table, close: async () => {} }
 
+  // The storage-domain facility, with the one rule a reload has to respect: a
+  // name stays reserved for the instance that opened it until THAT instance
+  // closes it. `shared` carries the previous instance's facility, so a reload
+  // meets the same reservation the real one does.
+  const facility = options.shared?.facility ?? {
+    /** Names held by an instance that has not closed yet. */
+    reserved: new Set(),
+    open(spec) {
+      if (this.reserved.has(spec.name)) {
+        const error = new Error(`domain '${spec.name}' is already open`)
+        error.code = 'already-open'
+        return Promise.reject(error)
+      }
+      this.reserved.add(spec.name)
+      const reserved = this.reserved
+      // One shared record map, so every instance's table reads the same medium.
+      return Promise.resolve({ table: () => table, close: async () => { reserved.delete(spec.name) } })
+    },
+  }
+
   const projections = new Map()
   const ctx = {
     // The plugin's own context. Its `root` is the application root, exactly as Cordis
@@ -294,7 +314,7 @@ function harness(options = {}) {
           form: (form) => {
             if (form !== 'domain') throw new Error(`form "${form}" is not mounted`)
             if (options.noStore === true) throw new Error('form "domain" is not mounted')
-            return { open: async () => ({ table: () => table, close: async () => {} }) }
+            return facility
           },
         }
       }
@@ -367,6 +387,7 @@ function harness(options = {}) {
   return {
     ctx, parent, child, agentsApi, tools, parentTools, childTools, listeners, disposers, created, attached,
     delivered, warnings, store, storeRecords, requestResolvers, archived, renamed, projections, execSignal: undefined,
+    facility,
     root,
     /** The context the last delegation created its child through: `'root'` or `'plugin'`. */
     get createdBy() { return createdBy },
@@ -1050,6 +1071,76 @@ check('maxDepth: provider-managed leaves the depth unbounded', async () => {
   })
   await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
   assert.equal(fake.storeRecords.size, 2, 'the delegation proceeded past the first level')
+})
+
+check('a reload waits out the previous instance instead of adopting a domain it closes', async () => {
+  const first = await mount()
+  await delegate(first, { name: 'x', template: 'medium', prompt: 'look' }, false)
+  assert.equal(first.storeRecords.size, 1)
+
+  // The reload activates the second instance while the first still holds the
+  // domain — the window in which the facility answers `already-open`.
+  const second = harness({
+    liveAgents: [first.parent],
+    shared: { storeRecords: first.storeRecords, facility: first.facility },
+  })
+  const mounting = apply(second.ctx, { templates: TEMPLATES })
+  // The previous instance's teardown lands while the new one is waiting.
+  await new Promise(resolve => setTimeout(resolve, 30))
+  for (const { dispose } of [...first.disposers].reverse()) {
+    try { await dispose?.() } catch { /* a reload's teardown is best-effort */ }
+  }
+  await mounting
+
+  assert.equal(first.facility.reserved.has('subagent_templates'), true,
+    'the reloaded instance holds its own reservation, not the closed one')
+  assert.equal(second.storeRecords.size, 1, 'the mapping survived the reload')
+  await delegate(second, { name: 'y', template: 'medium', prompt: 'look' }, false)
+  assert.equal(second.storeRecords.size, 2, 'the reloaded instance still records mappings')
+})
+
+check('config: the defaults are maxActiveSubagents 4 and maxDepth 1', () => {
+  const normalized = normalizeConfig({ templates: TEMPLATES })
+  assert.equal(normalized.maxActiveSubagents, 4)
+  assert.equal(normalized.maxDepth, 1)
+  assert.equal(normalizeConfig({ templates: TEMPLATES, maxActiveSubagents: 8 }).maxActiveSubagents, 8)
+  assert.throws(() => normalizeConfig({ templates: TEMPLATES, maxActiveSubagents: 0 }), /positive safe integer/)
+  assert.throws(() => normalizeConfig({ templates: TEMPLATES, maxActiveSubagents: 1.5 }), /positive safe integer/)
+})
+
+check('maxActiveSubagents: refuses a delegation while the cap is full', async () => {
+  const fake = await mount({
+    config: { templates: TEMPLATES, maxActiveSubagents: 1 },
+    liveAgents: [{ id: 'child-a', status: 'running' }],
+  })
+  fake.storeRecords.set('child-a', {
+    parentSessionId: 'parent-1',
+    name: 'a',
+    templateId: 'medium',
+    createdAt: 1,
+    cwd: 'C:/work',
+  })
+  await assert.rejects(
+    () => delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false),
+    /active subagent limit: 1/,
+  )
+  assert.equal(fake.storeRecords.size, 1, 'the refused delegation records nothing')
+})
+
+check('maxActiveSubagents: a child that has finished holds no slot', async () => {
+  const fake = await mount({
+    config: { templates: TEMPLATES, maxActiveSubagents: 1 },
+    liveAgents: [{ id: 'child-a', status: 'idle' }],
+  })
+  fake.storeRecords.set('child-a', {
+    parentSessionId: 'parent-1',
+    name: 'a',
+    templateId: 'medium',
+    createdAt: 1,
+    cwd: 'C:/work',
+  })
+  await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
+  assert.equal(fake.storeRecords.size, 2, 'a finished child must not block new work')
 })
 
 let failed = 0

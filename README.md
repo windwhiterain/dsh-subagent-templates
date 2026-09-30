@@ -273,7 +273,8 @@ child that dies `disposed` on its own is the lifetime-binding bug above.
   name: 'dsh-subagent-templates'
   config:
     toolName: subagent        # optional; the model-facing tool name
-    maxDepth: 2               # optional; how deep delegation may nest
+    maxDepth: 1               # optional; how deep delegation may nest (default 1)
+    maxActiveSubagents: 4     # optional; how many children may work at once (default 4)
     templates:                # required; at least one
       - id: medium            # required; lowercase letters, digits, hyphens; the `template` argument
         name: Medium          # required; display name
@@ -307,12 +308,13 @@ child's preset already admits and never widens it.
 
 ### `maxDepth`
 
-`maxDepth` bounds how deep delegation may nest. A delegation is refused when it
-would create a child deeper than the cap, counting a session that has delegated
-nothing as depth 0, so its child is depth 1. Omit it for no bound. The value
-`provider-managed` states that the bound belongs to the delegation provider; this
-plugin delegates to ordinary root Sessions and mounts no provider, so it enforces
-nothing for either value.
+`maxDepth` bounds how deep delegation may nest, and **defaults to 1**: a session
+may delegate, and a child of that delegation may not delegate again. A delegation
+is refused when it would create a child deeper than the cap, counting a session
+that has delegated nothing as depth 0, so its child is depth 1. Set it higher, or
+to `provider-managed` to state that the bound belongs to the delegation provider
+— this plugin delegates to ordinary root Sessions and mounts no provider, so it
+enforces nothing for that value.
 
 A template child carries no `parentSession` header — that omission is what keeps
 its model picker — so the Harness cannot answer its depth. The plugin counts it by
@@ -320,11 +322,25 @@ walking its own mapping store instead. With no storage domain form mounted there
 is no recorded chain to walk, so the cap cannot be enforced and delegations
 proceed.
 
+### `maxActiveSubagents`
+
+`maxActiveSubagents` bounds how many of one session's children may be **working at
+once**, and **defaults to 4**. A child that has finished stops counting, so it
+frees its slot immediately — the same rule the Harness's own subagent activation
+pool follows. A child that finished but was never deleted therefore does not block
+new work; only children still running do.
+
+The cap is per delegating session, not per host: each session gets its own, exactly
+as each session has its own child names. It reads the same mapping store as
+`maxDepth`, so with no storage domain form mounted the count is unanswerable and
+delegations proceed.
+
 Configuration is validated at activation: an unknown field, a malformed id, a
-duplicate id, an unusable `toolFilter`, or a `maxDepth` that is neither a
-non-negative integer nor `provider-managed` fails the row instead of the first
-delegation. A `background` field from an older patch is an unknown field, so it
-fails the row rather than being ignored.
+duplicate id, an unusable `toolFilter`, a `maxDepth` that is neither a
+non-negative integer nor `provider-managed`, or a `maxActiveSubagents` that is not
+a positive integer fails the row instead of the first delegation. A `background`
+field from an older patch is an unknown field, so it fails the row rather than
+being ignored.
 
 ## Results
 
