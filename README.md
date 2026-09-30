@@ -382,7 +382,8 @@ being ignored.
 ## Results
 
 A **foreground** call waits for the child's turn to settle and returns its
-closing text as the tool result.
+closing text as the tool result — that call's result and nothing else, because
+the parent is reading it there.
 
 A **background** call returns the child's name immediately and delivers the
 child's output to the parent as a `subagent-settled` notice when the child
@@ -393,10 +394,10 @@ An **interrupted turn is not an outcome.** A user who stops a delegated child is
 redirecting it rather than ending the delegation: the child keeps its session and
 everything it had done, so a foreground call keeps waiting for it and a
 background watch stays armed. Whichever turn the child ends naturally is what
-reports — that turn's closing text as the tool result, or a `subagent-settled`
-notice — and the interruption itself never fails a delegating call and never
-answers one. A child nothing wakes again leaves the wait pending on purpose;
-`delete_subagent`, or cancelling the delegating call, is what ends it.
+reports — the foreground call's tool result, or a `subagent-settled` notice — and
+the interruption itself never fails a delegating call and never answers one. A
+child nothing wakes again leaves the wait pending on purpose; `delete_subagent`,
+or cancelling the delegating call, is what ends it.
 
 Only a **natural end** is reported: `completed`, `max-tokens`, or the child's own
 failure. A turn the host refused admission to (`blocked`) and a turn that never

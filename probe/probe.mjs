@@ -975,6 +975,19 @@ check('foreground: the user\'s stop is waited through, not failed', async () => 
   assert.equal(value.output[0].text, 'done')
 })
 
+check('foreground: the result is the tool result and nothing else', async () => {
+  const fake = await mount({ parentStatus: 'running' })
+  const value = await delegate(fake, { name: 'reviewer', template: 'high', prompt: 'look' }, false)
+  assert.equal(value.output[0].text, 'done')
+  // The parent reads this result here, so a notice too would be the same answer
+  // twice. Only a background call has nobody reading a result.
+  assert.equal(
+    fake.delivered.some(([, message]) => message.source?.kind === 'subagent-settled'),
+    false,
+    'a foreground result is not also delivered as a notice',
+  )
+})
+
 check('foreground: a child nothing wakes again leaves the call waiting', async () => {
   const fake = await mount({ deferredIdle: true })
   const call = fake.tools.get('subagent').execute(
