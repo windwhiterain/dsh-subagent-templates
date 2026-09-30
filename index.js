@@ -24,8 +24,11 @@
  *
  * A foreground call returns the child's output as its tool result; a background
  * call returns the child's name and delivers the output to the parent as a
- * settlement notice when the child finishes on its own terms. A child stopped
- * by an external cause settles silently.
+ * settlement notice when the child finishes on its own terms. An interrupted
+ * turn is not an outcome: a child the user stops keeps its session, so the call
+ * waiting for it keeps waiting and a background watch stays armed until the
+ * child's next turn ends naturally. Only deleting the child ends a background
+ * watch without a result.
  *
  * A template child is an ordinary root Session, so it is deliberately absent from
  * the Harness subagent registry. That is what keeps its model picker, and it is
@@ -80,8 +83,8 @@ export async function apply(ctx, rawConfig) {
   /**
    * Live background children, keyed by child session id. A template child is a
    * root Session, so nothing in the host tracks it for us: this registry is the
-   * only thing that can stop one on an external cause and keep its settlement
-   * silent.
+   * only thing that can end one on an explicit delete, which also ends the
+   * settlement watch that was waiting for its result.
    */
   const running = new Map()
 
@@ -126,21 +129,29 @@ export async function apply(ctx, rawConfig) {
   }
 
   /**
-   * Register one background child so an external stop can reach it.
+   * Register one background child so an explicit end can reach it.
    * @param sessionId - the child session id.
    * @param parentSessionId - the delegating parent session id.
-   * @param child - the child's Agent, owning handle, and lifetime controller.
+   * @param child - the child's Agent, owning handle, lifetime controller, and
+   *   the stop of its settlement watch.
    */
   const registerChild = (sessionId, parentSessionId, child) => {
     running.set(sessionId, { parentSessionId, ...child })
   }
 
   /**
-   * Stop one background child on an external cause, keeping its settlement
-   * silent. The child's lifetime controller is the only thing that owns it, so
-   * aborting that — then releasing the handle — is what actually stops it.
-   * Either step may be refused by a Session whose scope is already unwound; that
-   * is a diagnostic, not a teardown failure.
+   * Stop one background child for good: abort its lifetime, release the handle,
+   * and end its settlement watch.
+   *
+   * The child's lifetime controller is the only thing that owns it, so aborting
+   * that — then releasing the handle — is what actually stops it. Either step
+   * may be refused by a Session whose scope is already unwound; that is a
+   * diagnostic, not a teardown failure.
+   *
+   * The watch is stopped here and nowhere else, because this is the one path
+   * that ends a delegated child: an interruption leaves the child live and its
+   * watch armed (its next natural turn is what reports), but a deleted child can
+   * never settle, and a watch that outlived it could only wait forever.
    * @param sessionId - the child session id.
    * @param reason - why it is being stopped.
    */
@@ -148,6 +159,7 @@ export async function apply(ctx, rawConfig) {
     const child = running.get(sessionId)
     if (child === undefined) return
     running.delete(sessionId)
+    child.stopWatch?.()
     try {
       child.lifetime.abort(new Error(`subagent-templates: ${reason}`))
     } catch (error) {

@@ -142,9 +142,13 @@ the `subagent` call carrying the child's text, plus the absence of the
    `subagent "<name>" finished.` and carrying the child's closing text, with no
    `job_output`/`send_message`/`list_agents` collection call before it. A template
    alone never makes a call run in the background.
-4. With the child stopped by an external cause (the teardown case below), the
-   process still exits 0 and the parent log has **no** `subagent-settled`
-   notice: an external stop settles silently.
+4. With the child's own turn interrupted — the user's stop button, or the
+   teardown case below — the process still exits 0 and the parent log has **no**
+   `subagent-settled` notice for that turn: an interruption is not an outcome, so
+   the watch it leaves behind reports nothing. A run that then starts the child's
+   *next* turn (a `message_subagent` call, or a user message in the child's own
+   session) must report **that** turn's text, under the same child name: an
+   interrupted child is redirected, not failed.
 5. The plugin's storage domain `subagent_templates` (JSON under the dev home)
    holds a record for the child session id with the right `parentSessionId`,
    `templateId`, and `name`, and a second delegation reusing that name under the
@@ -163,4 +167,5 @@ keep the parent alive (e.g. a sleep step) long enough for the child to settle,
 otherwise the process exits first and the notice is never delivered or asserted.
 The teardown case (requirement 4) is the inverse: let the parent quiesce so the
 process unwinds while the child is still live, and assert silence plus a clean
-exit.
+exit. The aborted turn leaves its settlement wait pending, and a pending wait
+holds no handle, so it cannot keep the process alive.

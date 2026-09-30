@@ -99,8 +99,9 @@ mapping and naming:
 
 `interrupt_subagent` and `delete_subagent` are the two ends of one decision:
 interrupt stops the work and leaves the child usable, delete ends it. An
-interrupted child settles silently, because it did not finish and there is no
-result to report.
+interrupted child reports nothing for the turn that was stopped, because it did
+not finish and there is no result to report; the delegation itself is still open,
+and whatever the child's next turn produces is what reports (see "Results").
 
 Two things are deliberately **not** reproduced:
 
@@ -293,9 +294,45 @@ child that dies `disposed` on its own is the lifetime-binding bug above.
 A template fixes only what a child *is*. It does not say whether a delegation
 waits; `run_in_background` on the call does.
 
-`provider`, `model`, and `reasoningEffort` are the child's starting route: they
-seed its first request, and the child's own model picker can change them
-afterwards.
+### The effective template list comes from the profile patch
+
+This package's own `cordis.patch.yml` is a **bundle layer**: the host re-reads it
+on every profile recomposition but never watches it, so an edit there applies at
+the next recomposition rather than when it is saved. A profile override replaces
+the whole `config` object, so the effective list is the last layer that declares
+one.
+
+The only layers the host watches are the profile's own `cordis.patch.yml` and
+`$DSH_HOME/cordis.patch.yml`. Put your templates in the profile's:
+
+```yaml
+- id: subagent-templates
+  name: 'dsh-subagent-templates'
+  disabled: false
+  config:
+    toolName: subagent
+    templates:
+      - id: medium
+        name: Medium
+        description: >-
+          coding, implement, explore, investigate.
+        provider: opencode-go
+        model: deepseek-v4.1-flash
+        preset: personal
+        reasoningEffort: high
+```
+
+An id-targeted override must restate every key the row needs — `toolName` and
+`templates` here, with `maxDepth` and `maxActiveSubagents` falling back to their
+defaults. Saving that file applies the new list without restarting the host, by
+restarting this row: `apply()` re-runs and the tools re-register, while live
+children are untouched (they are root Sessions created through the application
+root), and a settlement watch or a waiting foreground call keeps working across
+the restart — both read the Agent registry through that same root context.
+
+A template's `provider`, `model`, and `reasoningEffort` are the child's starting
+route: they seed its first request, and the child's own model picker can change
+them afterwards.
 
 `persona` gives the child a persona of its own. It is registered as a
 `deployment:persona-prefix` section on the child's scope, so it shadows the
@@ -352,11 +389,19 @@ child's output to the parent as a `subagent-settled` notice when the child
 finishes on its own terms. An idle parent is woken; a busy one receives it at its
 next step. No collection call is involved.
 
-A child stopped by an **external cause** — the user, a disposed parent, a plugin
-unload, a process exit — settles silently: no notice reaches the parent, because
-there is nobody left to act on a result they did not ask for. Only a natural
-settlement (completed, max-tokens, refusal, or the child's own failure) is
-reported.
+An **interrupted turn is not an outcome.** A user who stops a delegated child is
+redirecting it rather than ending the delegation: the child keeps its session and
+everything it had done, so a foreground call keeps waiting for it and a
+background watch stays armed. Whichever turn the child ends naturally is what
+reports — that turn's closing text as the tool result, or a `subagent-settled`
+notice — and the interruption itself never fails a delegating call and never
+answers one. A child nothing wakes again leaves the wait pending on purpose;
+`delete_subagent`, or cancelling the delegating call, is what ends it.
+
+Only a **natural end** is reported: `completed`, `max-tokens`, or the child's own
+failure. A turn the host refused admission to (`blocked`) and a turn that never
+ended are stops rather than results, so a background watch reports nothing for
+either; a deleted child reports nothing at all.
 
 ## Install
 
@@ -429,8 +474,10 @@ rather than a second route to the same children.
   design; changing the child's model afterwards is the user's action in its
   picker.
 - **No structured output.** A template call returns the child's closing text.
-- **No editing UI.** Templates live in configuration; the profile patch is
-  live-reloaded, so an edit applies to the next delegation without a restart.
+- **No editing UI.** Templates live in configuration. Put them in the profile's
+  own `cordis.patch.yml`, which is watched, and an edit applies to the next
+  delegation without a host restart — see "The effective template list comes from
+  the profile patch".
 - **Replicated Harness internals.** `lib/harness.js` mirrors shipped files that a
   bundle cannot import. A Harness upgrade that changes the final-output
   selection rule or the turn-end vocabulary must be reflected there. The file
@@ -487,7 +534,10 @@ a recomposition that changes this entry's composed `config` restarts the entry.
 Live children survive all of that, because they are created through the
 application root context rather than this plugin's (see "A child is never reaped
 automatically"); a child that dies `disposed` anyway means that rule has been
-broken again.
+broken again. So does everything that has to outlive the entry: the settlement
+delivery and the child's `ask_parent` read the Agent registry through that same
+root context, and an armed settlement watch lives on the child's own scope, so a
+template edit mid-delegation neither loses a child's result nor strands it.
 
 The host also has no way to load a plugin's client half unless its `package.json`
 declares the `./client` export and the `dsh.client` manifest; a client file that
@@ -507,9 +557,10 @@ drives the Harness's own storage code, so it runs from a Harness checkout with
 
 `probe/probe.mjs` runs the delegation path — session creation, the name that
 titles it, name uniqueness, the required background flag, preset join, the model
-default the user can override, foreground settlement, background delivery,
-external-stop silence, the two owners that keep a child alive (the creation
-signal, and the app root context it is created through), the three tools that
+default the user can override, foreground settlement, background delivery, a
+stopped turn reporting nothing and being waited through, the two owners that keep
+a child alive (the creation signal, and the app root context it is created
+through), the three tools that
 stand in for the native ones, the scope they are installed into, adoption after a
 reload, `delete_subagent` by name, the projection rows, the mapping store, and
 configuration rejection — against in-memory fakes, with no Harness and no model.

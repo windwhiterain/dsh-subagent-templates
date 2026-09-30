@@ -384,11 +384,25 @@ function harness(options = {}) {
   const agentsApi = agentsFor('plugin')
   root.get = (key) => (key === 'agents' ? agentsFor('root') : undefined)
 
+  /**
+   * Model the child starting another turn and ending it naturally.
+   *
+   * The state that decides an outcome is the log, not a flag: clearing the
+   * cancellation cause is what makes `snapshotEvents()` report a completed turn
+   * again, and the status transition is what a watcher waiting for the child's
+   * next turn is armed on. Both happen here, in that order.
+   */
+  const resumeChild = () => {
+    cancelled = null
+    child.status = 'running'
+    listeners.get('child:agent/status')?.({ agent: child, status: 'running' })
+    child.status = 'idle'
+  }
+
   return {
     ctx, parent, child, agentsApi, tools, parentTools, childTools, listeners, disposers, created, attached,
     delivered, warnings, store, storeRecords, requestResolvers, archived, renamed, projections, execSignal: undefined,
-    facility,
-    root,
+    facility, root, resumeChild,
     /** The context the last delegation created its child through: `'root'` or `'plugin'`. */
     get createdBy() { return createdBy },
   }
@@ -439,6 +453,23 @@ const checks = []
 /** Register one probe check. */
 function check(name, body) {
   checks.push([name, body])
+}
+
+/** Await one scheduling turn, so a promise chain the plugin owns can advance. */
+const tick = () => new Promise(resolve => setImmediate(resolve))
+
+/**
+ * Await a condition the plugin reaches asynchronously, failing rather than
+ * hanging the probe when it never holds.
+ * @param condition - the condition to poll.
+ * @param message - what the condition means, shown on failure.
+ */
+async function until(condition, message) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (condition()) return
+    await tick()
+  }
+  assert.ok(condition(), message)
 }
 
 check('config: rejects unknown fields, bad ids, duplicates, and empty lists', () => {
@@ -873,11 +904,109 @@ check('delete_subagent finds the child by name and touches only the caller\'s ow
   assert.equal(fake.storeRecords.has(create.sessionId), false)
 })
 
-check('amend 2: a child that refused by the user (aborted turn) settles silently', async () => {
-  const fake = await mount({ parentStatus: 'running', stopKind: 'aborted', whenIdle: 'never' })
+check('an interrupted turn is not an outcome: the stopped turn reports nothing', async () => {
+  const fake = await mount({ parentStatus: 'running', deferredIdle: true })
   await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
-  await new Promise(resolve => setImmediate(resolve))
-  assert.equal(fake.delivered.length, 0)
+  await tick()
+  fake.child.cancel({ kind: 'user' })
+  await tick()
+  assert.equal(fake.delivered.length, 0, 'a stopped child reports nothing for the stopped turn')
+})
+
+check('background: a stopped child is waited through, and its next turn is reported', async () => {
+  const fake = await mount({ parentStatus: 'running', deferredIdle: true })
+  await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  await tick()
+  // The user's own stop button: the child keeps its session and its transcript.
+  fake.child.cancel({ kind: 'user' })
+  await tick()
+  assert.equal(
+    fake.delivered.some(([, message]) => message.source?.kind === 'subagent-settled'),
+    false,
+    'the interruption itself is never a settlement',
+  )
+
+  // The user redirects the child, and that turn ends naturally.
+  fake.resumeChild()
+  await until(
+    () => fake.delivered.some(([, message]) => message.source?.kind === 'subagent-settled'),
+    'the child\'s next natural end is reported',
+  )
+  const [, message] = fake.delivered.find(([, sent]) => sent.source?.kind === 'subagent-settled')
+  assert.equal(message.content[0].text, 'subagent "explorer" finished.')
+})
+
+check('background: deleting the child ends its settlement watch', async () => {
+  const fake = await mount({ parentStatus: 'running', deferredIdle: true })
+  await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  await tick()
+  fake.child.cancel({ kind: 'user' })
+  await tick()
+  await fake.parentTools.get('delete_subagent').execute(
+    { name: 'explorer' },
+    { agent: fake.parent, signal: new AbortController().signal },
+  )
+  // A deleted child can never settle, so its watch must not stay armed: a turn
+  // that could no longer report anything must not be reported either.
+  fake.resumeChild()
+  await tick()
+  assert.equal(fake.delivered.length, 0, 'a deleted child reports nothing')
+})
+
+check('foreground: the user\'s stop is waited through, not failed', async () => {
+  const fake = await mount({ deferredIdle: true })
+  const signal = new AbortController().signal
+  const call = fake.tools.get('subagent').execute(
+    { name: 'reviewer', template: 'high', prompt: 'look', run_in_background: false },
+    { agent: fake.parent, signal },
+  )
+  await until(() => fake.child.id !== '', 'the child exists before it is stopped')
+  fake.child.cancel({ kind: 'user' })
+  let settled = false
+  void call.then(() => { settled = true }, () => { settled = true })
+  await tick()
+  assert.equal(settled, false, 'a stopped turn is not an outcome: the call keeps waiting')
+
+  // The user tells the child what to do instead; that turn is the result.
+  fake.resumeChild()
+  const value = await call
+  assert.equal(value.kind, 'foreground')
+  assert.equal(value.name, 'reviewer')
+  assert.equal(value.output[0].text, 'done')
+})
+
+check('foreground: a child nothing wakes again leaves the call waiting', async () => {
+  const fake = await mount({ deferredIdle: true })
+  const call = fake.tools.get('subagent').execute(
+    { name: 'reviewer', template: 'high', prompt: 'look', run_in_background: false },
+    { agent: fake.parent, signal: new AbortController().signal },
+  )
+  await until(() => fake.child.id !== '', 'the child exists before it is stopped')
+  fake.child.cancel({ kind: 'user' })
+  let settled = false
+  void call.then(() => { settled = true }, () => { settled = true })
+  await tick()
+  await tick()
+  // Waiting is the contract, not a hang to be papered over: the delegating
+  // session's own stop is what ends this.
+  assert.equal(settled, false, 'the call waits for the child\'s next turn')
+})
+
+check('foreground: cancelling the delegating call ends the wait and stops the child', async () => {
+  const fake = await mount({ deferredIdle: true })
+  const controller = new AbortController()
+  const call = fake.tools.get('subagent').execute(
+    { name: 'reviewer', template: 'high', prompt: 'look', run_in_background: false },
+    { agent: fake.parent, signal: controller.signal },
+  )
+  await until(() => fake.child.id !== '', 'the child exists before the call is cancelled')
+  controller.abort()
+  await assert.rejects(() => call, /the delegating tool call was cancelled/)
+  // The child is not left running: the caller asked for a result it will never read.
+  assert.ok(
+    fake.created.some(entry => entry[0] === 'cancel' && entry[1] === 'disposed'),
+    'cancelling the call stops the child it created',
+  )
 })
 
 check('the parent/child mapping is recorded through the storage hub', async () => {
