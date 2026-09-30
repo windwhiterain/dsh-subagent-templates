@@ -350,6 +350,21 @@ and `toolFilter` are untouched by the pool.
 `list_subagent_templates` reports which form each template uses, so the model can
 tell a fixed route from a pool without a second delegation.
 
+### `toolFilter`
+
+A template may narrow the child's tool set: `allow` names the tools it keeps, `deny`
+names the ones it loses, and a template that declares neither keeps everything.
+
+An empty `allow` is a **lockout, not a no-op**: the child keeps no tool but the ones
+this plugin installs itself (`ask_parent`). A filter with neither `allow` nor `deny`
+fails the row, and the settings page refuses to write one that names no tool at all,
+so a lockout has to be written by hand.
+
+The schema fills nothing in. An absent `toolFilter`, and an absent `allow` inside
+one, must stay absent: schemastery materializes an absent array as `[]`, so a
+template declaring only `deny` would otherwise reach the plugin as
+`{ deny: [...], allow: [] }` and produce a child with no tools at all.
+
 ### The effective template list comes from the profile patch
 
 This package's own `cordis.patch.yml` is a **bundle layer**: the host re-reads it

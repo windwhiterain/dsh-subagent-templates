@@ -1198,6 +1198,43 @@ check('toolFilter: a template without one restricts nothing', async () => {
   assert.equal(fake.created.find(([what]) => what === 'restrict'), undefined)
 })
 
+check('toolFilter: the row schema invents none, so a filterless template keeps the whole tool set', async () => {
+  // A running row's configuration reaches `apply` freshly parsed by its schema.
+  // Schemastery fills an absent field from its default and an array's default is
+  // `[]`, so this path — not the plain-config case above — is where `allow: []`,
+  // a child with no tools but `ask_parent`, came from.
+  const parsed = Config({ templates: TEMPLATES })
+  const fake = await mount({ config: parsed })
+  await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
+  assert.equal(parsed.templates.get()[0].toolFilter, undefined, 'the schema left the absent filter absent')
+  assert.equal(fake.created.find(([what]) => what === 'restrict'), undefined)
+})
+
+check('the row schema adds no key a template did not declare', () => {
+  // The general form of the `toolFilter` regression: schemastery materializes an
+  // absent array or object from its default, so any array- or object-typed field
+  // added here without `default(undefined)` would silently hand the plugin a
+  // value the row never wrote.
+  const parsed = Config({ templates: [TEMPLATES[0]] })
+  assert.deepEqual(
+    Object.keys(parsed.templates.get()[0]).sort(),
+    ['description', 'id', 'model', 'name', 'preset', 'provider'],
+  )
+  const declared = Config({ templates: [{ ...TEMPLATES[0], persona: 'You are terse.', toolFilter: { deny: ['write'] } }] })
+  assert.deepEqual(
+    Object.keys(declared.templates.get()[0]).sort(),
+    ['description', 'id', 'model', 'name', 'persona', 'preset', 'provider', 'toolFilter'],
+  )
+})
+
+check('toolFilter: a deny-only filter survives the schema without an invented allow', async () => {
+  const parsed = Config({ templates: [{ ...TEMPLATES[0], toolFilter: { deny: ['write'] } }] })
+  const fake = await mount({ config: parsed })
+  await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
+  const restriction = fake.created.find(([what]) => what === 'restrict')
+  assert.deepEqual(restriction?.[1], { deny: ['write'] }, 'an invented `allow: []` would leave the child no tools')
+})
+
 check('maxDepth: refuses a delegation past the cap, creating and recording nothing', async () => {
   const fake = await mount({ config: { templates: TEMPLATES, maxDepth: 0 } })
   await assert.rejects(
