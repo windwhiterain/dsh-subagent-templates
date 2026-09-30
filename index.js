@@ -51,7 +51,10 @@
  *
  * This plugin imports no Harness package: out-of-tree bundles resolve from the
  * profile, which does not put the Harness's own modules on this package's
- * resolution path. `./lib/harness.ts` holds the replicated Harness behavior.
+ * resolution path. Its one dependency is the schema library
+ * `@deepseek-ai/schemastery`, which `./lib/config.js` builds the row's `Config`
+ * from — the schema the Loader validates the row with and the Settings surface
+ * edits — and `./lib/harness.js` holds the replicated Harness behavior.
  *
  * @module dsh-subagent-templates
  */
@@ -72,14 +75,18 @@ export const name = 'subagent-templates'
 export const inject = ['tools']
 export { Config }
 
+/** Configuration fields the Settings surface may edit on a running row. */
+const VOLATILE_FIELDS = Object.freeze(['templates', 'maxDepth', 'maxActiveSubagents'])
+
 /**
  * Mount one template delegation composition.
  * @param ctx - the context that owns every registration, including the tool row.
  * @param rawConfig - the row's configuration, validated here and by {@link Config}.
  */
 export async function apply(ctx, rawConfig) {
-  const config = normalizeConfig(rawConfig)
-  const templates = config.templates
+  // Volatile fields arrive as references the Loader updates in place, so the
+  // configuration is read through `normalizeConfig` again whenever one changes.
+  const initial = normalizeConfig(rawConfig)
 
   /**
    * Live background children, keyed by child session id. A template child is a
@@ -239,34 +246,83 @@ export async function apply(ctx, rawConfig) {
     if ((store?.childrenOf(agent.id) ?? []).length > 0) adoptChildTools(agent)
   }
 
-  ctx.effect(
-    () => ctx.tools.register(createDelegationTool({
-      ctx,
-      toolName: config.toolName,
-      templates,
-      store,
-      claimName,
-      onDelegated: adoptChildTools,
-      registerChild,
-      maxDepth: config.maxDepth,
-      maxActiveSubagents: config.maxActiveSubagents,
-    })),
-    `${name}.tool`,
-  )
-  ctx.effect(() => ctx.tools.register(createTemplateListTool(templates)), `${name}.list`)
+  /**
+   * Template id -> display name, for the sidebar projection. Rebuilt with the
+   * registrations below, because the projection closes over this binding rather
+   * than over a snapshot of it.
+   */
+  let templateNames = new Map()
+
+  /**
+   * Registrations derived from the template list and the two caps.
+   *
+   * They are rebuilt rather than registered once, because a Settings edit commits
+   * those volatile values into the running configuration: the delegation tool's
+   * description names every template it offers, so a stale one would advertise a
+   * template the row no longer has.
+   */
+  let templateRegistrations = []
+  const registerTemplateTools = (current) => {
+    for (const dispose of templateRegistrations) dispose()
+    templateNames = new Map(current.templates.map(template => [template.id, template.name]))
+    templateRegistrations = [
+      ctx.tools.register(createDelegationTool({
+        ctx,
+        toolName: current.toolName,
+        templates: current.templates,
+        store,
+        claimName,
+        onDelegated: adoptChildTools,
+        registerChild,
+        maxDepth: current.maxDepth,
+        maxActiveSubagents: current.maxActiveSubagents,
+      })),
+      ctx.tools.register(createTemplateListTool(current.templates)),
+    ]
+  }
+  registerTemplateTools(initial)
+  ctx.effect(() => () => {
+    for (const dispose of templateRegistrations) dispose()
+  }, `${name}.tools`)
+
+  // A Settings edit commits volatile values into the running configuration and
+  // names the paths it changed. A value this row then refuses — an unknown field,
+  // a duplicate id — keeps the running registrations: the Loader has already
+  // committed the value, so the refusal is logged rather than thrown, and the next
+  // valid edit takes effect.
+  ctx.on('loader/volatile-update', (paths) => {
+    if (!paths.some(path => VOLATILE_FIELDS.includes(path[0]))) return
+    let next
+    try {
+      next = normalizeConfig(rawConfig)
+    } catch (error) {
+      ctx.logger.error(
+        'subagent-templates: the edited configuration was refused: '
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+      return
+    }
+    registerTemplateTools(next)
+  })
+
+  // This row ships a page of its own (`client.js`), which is where those volatile
+  // fields are edited, so the shipped auto-generated form for them is suppressed:
+  // one row, one page.
+  ctx.inject(['settings'], (child) => {
+    child.effect(() => child.settings.configure({ auto: false }, ctx.fiber), `${name}.settings`)
+  })
 
   // Publish the delegated children to the browser panel. The fold reads the
   // mapping store, so it is recomputed on every parent Session event — which is
   // when a child can have been added. The wire row carries only what the panel
   // draws; the template's display name is resolved here because the store
   // records the template id, which the panel never shows.
-  const templateName = new Map(templates.map(template => [template.id, template.name]))
   ctx.inject(['sessionProjections'], (child) => {
     child.effect(() => child.sessionProjections.register(childrenProjection(
       (sessionId) => (store?.childrenOf(sessionId) ?? []).map(entry => ({
         childSessionId: entry.childSessionId,
         name: entry.mapping.name,
-        templateName: templateName.get(entry.mapping.templateId) ?? entry.mapping.templateId,
+        templateName: templateNames.get(entry.mapping.templateId) ?? entry.mapping.templateId,
         createdAt: entry.mapping.createdAt,
       })),
     )), `${name}.projection`)

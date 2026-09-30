@@ -6,9 +6,12 @@ child — an agent preset, and an optional persona, so a delegating agent picks 
 template by name and description instead of naming a provider, a model, and a
 reasoning effort on every call.
 
-This is an out-of-tree bundle. It imports no Harness package: it is plain
-JavaScript over the `ctx` services, and `lib/harness.js` holds the small amount
-of Harness behavior it replicates. Nothing in the Harness checkout changes.
+This is an out-of-tree bundle. It imports one package — the schema library
+`@deepseek-ai/schemastery`, from which the row's `Config` schema is built; that
+schema is what the Loader validates the row with and what the Settings surface
+edits — and no Harness runtime package: otherwise it is plain JavaScript over the
+`ctx` services, and `lib/harness.js` holds the small amount of Harness behavior
+it replicates. Nothing in the Harness checkout changes.
 
 ## A template call creates an ordinary Session
 
@@ -296,6 +299,32 @@ child that dies `disposed` on its own is the lifetime-binding bug above.
 A template fixes only what a child *is*. It does not say whether a delegation
 waits; `run_in_background` on the call does.
 
+### Editing a running row in the browser
+
+The template list and the two caps are editable from the **Plugins** settings
+surface, on this row's own page: add, remove, reorder, and rewrite templates, with
+the route-or-pool choice as a switch, and save. The row does not restart — the
+edited values are committed into the running configuration and the delegation
+tool is rebuilt from them, so the next delegation sees the new list and a model
+calling the tool sees the new description. The page writes the profile patch
+(`cordis.patch.yml`), so the edit is the new default for the next start as well.
+
+The schema behind that page states exactly one route form per template and
+refuses anything else, so a template naming both a pool and a provider/model
+cannot be saved. `normalizeConfig` still runs over whatever the row holds, which
+is what catches what a schema cannot state — a duplicate id, a malformed
+`toolFilter`, an unknown field.
+
+`toolName` is deliberately **not** editable there: renaming the tool a model is
+currently calling needs the row to restart, so it stays in the patch document.
+
+Two consequences of a save are worth knowing before the first one. The row's
+`config` block is rewritten as data, so **comments inside it are not carried
+over** — keep commentary above the row, where it survives. And restoring all three
+fields to their shipped values removes the block altogether, at which point the row
+falls back to this bundle's own sample templates rather than keeping the list you
+had.
+
 ### One route, or a pool to resolve one from
 
 A template fixes **exactly one** of:
@@ -444,6 +473,19 @@ dsh plugin --profile <profile> add ./dsh-subagent-templates
 or the Plugin Manager's install action with this directory as the target. The
 bundle patch inserts the row at the Host plane.
 
+The row's schema is schemastery, so the package carries one dependency. A `link:`
+install does not install a linked package's dependencies, so install them in the
+checkout once:
+
+```sh
+npm install
+```
+
+Without it the row fails to activate with `ERR_MODULE_NOT_FOUND`. Adding the
+settings page to `dsh.client.inject` also means the first install — or any later
+change to that block — needs the host to restart: the client-module scan caches a
+package's manifest for the life of the process.
+
 A profile that mounts `dsh-base` without `dsh-web-app` (the shipped `headless`
 profile) also has the base bundle's own host-plane `tool-subagent` row, which
 registers the same `subagent` name; one tool layer rejects two registrations of
@@ -509,10 +551,10 @@ rather than a second route to the same children.
   service is absent or the pool is undefined. A template with a fixed
   `provider`/`model` needs nothing from it.
 - **No structured output.** A template call returns the child's closing text.
-- **No editing UI.** Templates live in configuration. Put them in the profile's
-  own `cordis.patch.yml`, which is watched, and an edit applies to the next
-  delegation without a host restart — see "The effective template list comes from
-  the profile patch".
+- **The row's schema owns the shape.** `toolName` cannot be edited from the
+  settings page because a rename needs the row to restart, and a template that
+  states neither a route nor a pool is refused wherever it is written. Everything
+  else about a template is free to change while the row runs.
 - **Replicated Harness internals.** `lib/harness.js` mirrors shipped files that a
   bundle cannot import. A Harness upgrade that changes the final-output
   selection rule or the turn-end vocabulary must be reflected there. The file
@@ -520,8 +562,10 @@ rather than a second route to the same children.
 - **The client half has no bundler.** `client.js` is served as one classic script,
   so it imports nothing, reaches React and the shared primitives through the
   module system's `require`, and injects its own stylesheet from `--dsw-*` tokens
-  instead of shipping a CSS file. A panel that grew real styling would want the
-  same treatment the shipped packages get.
+  instead of shipping a CSS file. The settings page it registers reads and writes
+  the row's `config` through the `configForms` service rather than talking to this
+  plugin, so it needs no host service of its own. A panel that grew real styling
+  would want the same treatment the shipped packages get.
 
 ## Durable storage
 
@@ -612,7 +656,12 @@ body it registers is driven against a jsdom document and the real React taken fr
 the Harness checkout's pnpm store. It checks the two-stage tab registration, that
 both dictionaries carry the same keys, the row the panel draws, opening a child,
 the delete question, the archive it performs, a refused archive, and the two ways
-a child stops being listed. It does not prove the panel inside a real browser.
+a child stops being listed. For the settings page it checks that the page
+registers only while the Host serves the row, the summary line, that an edit
+reaching the page stages and then saves as one whole-value mutation, that an
+invalid `toolFilter` and a blank id block the save, that restoring the shipped
+defaults unsets the three fields, and that a refused write keeps the draft. It does
+not prove the panel or the page inside a real browser.
 
 `probe/store.probe.mjs` runs the mapping store against the Harness's own storage
 code over a copy of the real store, which is where a record-format change is

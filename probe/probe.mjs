@@ -78,6 +78,8 @@ function harness(options = {}) {
   const attached = []
   const delivered = []
   const warnings = []
+  const settingsPresentations = []
+  const errors = []
   // `shared` reuses an earlier instance's durable records, which is what a hot
   // reload actually gets: the mapping lives in a storage domain, and the
   // replacement instance reopens the same one.
@@ -284,7 +286,12 @@ function harness(options = {}) {
     // gives every plugin one: whatever a plugin creates through `ctx` is owned by this
     // context's fiber, and whatever it creates through `ctx.root` outlives the plugin.
     root,
-    logger: { info: () => {}, debug: () => {}, warn: (line) => warnings.push(String(line)) },
+    logger: {
+      info: () => {},
+      debug: () => {},
+      warn: (line) => { warnings.push(String(line)) },
+      error: (line) => { errors.push(String(line)) },
+    },
     tools: {
       register: (definition) => {
         if (tools.has(definition.name)) throw new Error(`duplicate tool ${definition.name}`)
@@ -323,6 +330,9 @@ function harness(options = {}) {
       // The route-pool service belongs to another plugin, so a deployment
       // without it must be a case this probe can mount.
       if (key === 'llmQuotaRetry') return options.poolService
+      // The Settings surface is a host service; the plugin only states its page
+      // policy through it, so recording the presentations is the whole contract.
+      if (key === 'settings') return { configure: (presentation) => { settingsPresentations.push(presentation); return () => {} } }
       if (key === 'storage') {
         // The real accessor is the global storage HUB and its mounted domain
         // form, not the subtree-scoped `storageDomain` key. Model the hub so the
@@ -419,7 +429,7 @@ function harness(options = {}) {
 
   return {
     ctx, parent, child, agentsApi, tools, parentTools, childTools, listeners, disposers, created, attached,
-    delivered, warnings, store, storeRecords, requestResolvers, archived, renamed, projections, execSignal: undefined,
+    delivered, warnings, errors, settingsPresentations, store, storeRecords, requestResolvers, archived, renamed, projections, execSignal: undefined,
     facility, root, resumeChild,
     /** The context the last delegation created its child through: `'root'` or `'plugin'`. */
     get createdBy() { return createdBy },
@@ -1381,6 +1391,70 @@ check('list_subagent_templates reports a pool template without a fixed model', a
   assert.match(text, /route pool: medium \(a route with allowance is chosen for each subagent\)/)
   assert.match(text, /model: opencode-go\/deepseek-v4-pro/)
   assert.match(text, /agent preset: personal/)
+})
+
+check('the row schema marks the editable fields volatile and refuses both route forms at once', () => {
+  assert.equal(Config.dict.templates.meta.volatile, true, 'the template list is editable on a running row')
+  assert.equal(Config.dict.maxDepth.meta.volatile, true)
+  assert.equal(Config.dict.maxActiveSubagents.meta.volatile, true)
+  assert.notEqual(Config.dict.toolName.meta.volatile, true, 'a tool rename needs the row to restart')
+  assert.throws(
+    () => Config({ templates: [{ ...TEMPLATES[0], pool: 'medium' }] }),
+    /expected/,
+    'a template that fixes a route and names a pool matches neither form',
+  )
+  assert.throws(() => Config({ templates: [{ id: 'solo', name: 'Solo', description: 'Runs alone.' }] }), /expected/)
+  const pooled = Config({ templates: [{ id: 'solo', name: 'Solo', description: 'Runs alone.', pool: 'medium' }] })
+  assert.equal(pooled.templates.get().length, 1)
+  assert.equal(pooled.maxDepth.get(), 1, 'an absent cap keeps its default')
+})
+
+check('the row suppresses the shipped auto-generated form for its volatile fields', async () => {
+  const fake = await mount()
+  assert.deepEqual(fake.settingsPresentations, [{ auto: false }], 'one row, one page: the client half owns it')
+})
+
+check('a volatile edit rebuilds the template tools instead of restarting the row', async () => {
+  /** Stands in for the reference the Loader updates in place on a volatile field. */
+  const box = { held: TEMPLATES, get() { return this.held } }
+  const fake = await mount({ config: { templates: box, maxDepth: 1, maxActiveSubagents: 4 } })
+  assert.deepEqual(fake.tools.get('subagent').parameters.properties.template.enum, ['medium', 'high'])
+
+  box.held = [{ id: 'solo', name: 'Solo', description: 'Runs alone.', pool: 'medium' }]
+  fake.listeners.get('loader/volatile-update')([['templates']])
+
+  assert.deepEqual([...fake.tools.keys()].sort(), ['list_subagent_templates', 'subagent'], 'a rebuild replaces, never duplicates')
+  assert.deepEqual(fake.tools.get('subagent').parameters.properties.template.enum, ['solo'])
+  assert.match(fake.tools.get('subagent').description, /Solo/)
+  assert.equal(/high/.test(fake.tools.get('subagent').description), false, 'the dropped template is no longer advertised')
+  assert.match(await fake.tools.get('list_subagent_templates').execute({}, {}), /solo/)
+  assert.deepEqual(fake.errors, [])
+})
+
+check('an edit this row refuses keeps the running registrations', async () => {
+  const box = { held: TEMPLATES, get() { return this.held } }
+  const fake = await mount({ config: { templates: box, maxDepth: 1, maxActiveSubagents: 4 } })
+
+  box.held = [{ id: 'solo', name: 'Solo', description: 'Runs alone.', pool: 'medium', unknown: 1 }]
+  fake.listeners.get('loader/volatile-update')([['templates']])
+
+  assert.deepEqual(
+    fake.tools.get('subagent').parameters.properties.template.enum,
+    ['medium', 'high'],
+    'the refused edit left the registrations alone',
+  )
+  assert.equal(fake.errors.some(line => /edited configuration was refused/.test(line)), true)
+})
+
+check('only the paths this row may edit rebuild the tools', async () => {
+  const fake = await mount({ config: { templates: TEMPLATES, maxDepth: 1, maxActiveSubagents: 4 } })
+  const delegation = fake.tools.get('subagent')
+
+  fake.listeners.get('loader/volatile-update')([['toolName']])
+  assert.equal(fake.tools.get('subagent'), delegation, 'a path no page can edit rebuilds nothing')
+
+  fake.listeners.get('loader/volatile-update')([['maxDepth']])
+  assert.notEqual(fake.tools.get('subagent'), delegation, 'an edited cap reaches the tool')
 })
 
 let failed = 0
