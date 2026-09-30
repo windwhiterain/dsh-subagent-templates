@@ -1335,7 +1335,7 @@ check('a pool template resolves a route per child and assigns it that pool', asy
       assert.equal(pool, 'medium')
       return routes.shift()
     },
-    assignPool: (session, pool) => {
+    setPool: (session, pool) => {
       assigned.push([session.id, pool])
       return true
     },
@@ -1366,7 +1366,7 @@ check('a pool template without a route-pool service fails loud, creating nothing
 check('an unknown pool fails loud instead of delegating on a default model', async () => {
   const fake = await mount({
     config: { templates: [POOLED_TEMPLATE] },
-    poolService: { pickRoute: async () => undefined, assignPool: () => true },
+    poolService: { pickRoute: async () => undefined, setPool: () => true },
   })
   await assert.rejects(
     () => delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false),
