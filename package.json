@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Named subagent templates: each template fixes a model, an agent preset, and an optional persona, so a delegating agent picks a template by name instead of configuring provider, model, and reasoning effort per call, and a background template child's output is delivered to its parent without a collection call.",
+  "description": "Named subagent templates: each template fixes a starting route — one provider/model pair, or a route pool a route is resolved from per child — an agent preset, and an optional persona, so a delegating agent picks a template by name instead of configuring provider, model, and reasoning effort per call, and a background template child's output is delivered to its parent without a collection call.",
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -56,6 +56,6 @@
   },
   "meta": {
     "title": "Subagent Templates",
-    "description": "Delegates to a subagent built from a named template that fixes its model, agent preset, and persona."
+    "description": "Delegates to a subagent built from a named template that fixes its route (or the pool it resolves one from), agent preset, and persona."
   }
 }

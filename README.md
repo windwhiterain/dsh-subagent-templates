@@ -1,7 +1,8 @@
 # dsh-subagent-templates
 
 Named subagent templates for DeepSeek Harness. Each template fixes a starting
-model, an agent preset, and an optional persona, so a delegating agent picks a
+route — one provider/model pair, or a route pool a route is resolved from per
+child — an agent preset, and an optional persona, so a delegating agent picks a
 template by name and description instead of naming a provider, a model, and a
 reasoning effort on every call.
 
@@ -281,8 +282,9 @@ child that dies `disposed` on its own is the lifetime-binding bug above.
         name: Medium          # required; display name
         description: >-       # required; when to pick this template, in the model's vocabulary
           Executes and explores: reads code, runs commands, and reports what it found.
-        provider: command-code-goat   # required; a registered LLM provider id
-        model: deepseek/deepseek-v4.1-flash  # required; a model that provider serves
+        provider: command-code-goat   # one route: a registered LLM provider id …
+        model: deepseek/deepseek-v4.1-flash  # … and a model that provider serves
+        # pool: medium        # … OR the name of a route pool owned by dsh-llm-quota-retry
         preset: personal      # optional; agent preset the child joins (default: the deployment default)
         reasoningEffort: high # optional; the child's starting thinking effort
         maxTokens: 64000      # optional
@@ -293,6 +295,31 @@ child that dies `disposed` on its own is the lifetime-binding bug above.
 
 A template fixes only what a child *is*. It does not say whether a delegation
 waits; `run_in_background` on the call does.
+
+### One route, or a pool to resolve one from
+
+A template fixes **exactly one** of:
+
+- `provider` + `model` — one fixed route. Both are required, and neither may be
+  empty.
+- `pool` — the name of a route pool owned by
+  [`dsh-llm-quota-retry`](https://github.com/windwhiterain/dsh-llm-quota-retry).
+  The route is resolved **per child**, right before that child exists, from the
+  pool's ordered routes, skipping the ones whose provider is out of allowance. So
+  two subagents of one template can start on different providers, and a template
+  is how a session says "any of these will do, pick one that works".
+
+Declaring both, or neither, fails the row at activation. A `pool` template whose
+service is not mounted, or whose pool that service does not define, fails the
+delegation with a message naming the template and the pool — a child on the
+deployment's default model would be a delegation nobody chose.
+
+`reasoningEffort` on the template is the fallback: a resolved route may bring its
+own effort, and that one wins for the child. `maxTokens`, `preset`, `persona`,
+and `toolFilter` are untouched by the pool.
+
+`list_subagent_templates` reports which form each template uses, so the model can
+tell a fixed route from a pool without a second delegation.
 
 ### The effective template list comes from the profile patch
 
@@ -332,7 +359,9 @@ the restart — both read the Agent registry through that same root context.
 
 A template's `provider`, `model`, and `reasoningEffort` are the child's starting
 route: they seed its first request, and the child's own model picker can change
-them afterwards.
+them afterwards. A `pool` template's route is chosen the same way, from the pool,
+and the child's picker can change that too — and once the route it moved to falls
+outside the pool, `dsh-llm-quota-retry` stops managing it.
 
 `persona` gives the child a persona of its own. It is registered as a
 `deployment:persona-prefix` section on the child's scope, so it shadows the
@@ -472,8 +501,13 @@ rather than a second route to the same children.
   stays registered, idle and archived, until the process exits — the residue the
   shipped panel already leaves for any archived Session.
 - **No per-call model override.** A call names a template and nothing else, by
-  design; changing the child's model afterwards is the user's action in its
-  picker.
+  design; a pool template's route is resolved by the pool, and changing the
+  child's model afterwards is the user's action in its picker.
+- **A pool template depends on `dsh-llm-quota-retry`.** The pool, its balance
+  scripts, and the allowance marks belong to that plugin: this one only asks it
+  which route a child should start on, and fails the delegation loudly when the
+  service is absent or the pool is undefined. A template with a fixed
+  `provider`/`model` needs nothing from it.
 - **No structured output.** A template call returns the child's closing text.
 - **No editing UI.** Templates live in configuration. Put them in the profile's
   own `cordis.patch.yml`, which is watched, and an edit applies to the next
@@ -558,7 +592,9 @@ drives the Harness's own storage code, so it runs from a Harness checkout with
 
 `probe/probe.mjs` runs the delegation path — session creation, the name that
 titles it, name uniqueness, the required background flag, preset join, the model
-default the user can override, foreground settlement, background delivery, a
+default the user can override, a pool template resolving a different route for
+each child and failing loudly without its service, foreground settlement,
+background delivery, a
 stopped turn reporting nothing and being waited through, the two owners that keep
 a child alive (the creation signal, and the app root context it is created
 through), the three tools that

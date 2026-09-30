@@ -1,8 +1,9 @@
 /**
  * Named subagent templates for DeepSeek Harness.
  *
- * Each configured template fixes a starting model, an agent preset, and an
- * optional persona, and the `subagent` tool this plugin registers takes a
+ * Each configured template fixes a starting route — one provider/model pair, or
+ * a route pool resolved per child by `dsh-llm-quota-retry` — an agent preset, and
+ * an optional persona, and the `subagent` tool this plugin registers takes a
  * `template` argument so a delegating agent selects by name and description
  * instead of naming a provider, a model, and a reasoning effort per call. A
  * template says nothing about whether a child runs in the background: that is the

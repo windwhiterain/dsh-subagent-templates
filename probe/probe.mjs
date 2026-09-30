@@ -40,6 +40,18 @@ const TEMPLATES = [
 ]
 
 /**
+ * One template that names a route pool instead of a provider/model pair, so
+ * every child resolves its own route.
+ */
+const POOLED_TEMPLATE = {
+  id: 'medium',
+  name: 'Medium',
+  description: 'Executes and explores.',
+  pool: 'medium',
+  reasoningEffort: 'high',
+}
+
+/**
  * Build a fake Harness around the plugin.
  * @param options - per-probe behavior switches.
  * @param options.answer - the child's final assistant text.
@@ -52,6 +64,7 @@ const TEMPLATES = [
  * @param options.cancelThrows - the child refuses cancellation.
  * @param options.cwd - the parent's working directory.
  * @param options.config - the plugin configuration, when overriding the default.
+ * @param options.poolService - the route-pool service to publish, if any.
  * @param options.noStore - the deployment has no storage facility.
  * @param options.noSessionTitle - the deployment has no session-title service.
  * @param options.presetMountFails - mounting the preset fails.
@@ -122,6 +135,7 @@ function harness(options = {}) {
     options: {},
     steer: (message) => { created.push(['child.steer', message]) },
     session: {
+      id: '',
       header: { id: '' },
       requestHeader: () => undefined,
       // A cancelled turn ends `aborted`, which is what makes a stopped child an
@@ -306,6 +320,9 @@ function harness(options = {}) {
       if (key === 'workspaceRegistry') return workspaceRegistry
       if (key === 'sessionTitle') return options.noSessionTitle === true ? undefined : sessionTitle
       if (key === 'sessionProjections') return ctx.sessionProjections
+      // The route-pool service belongs to another plugin, so a deployment
+      // without it must be a case this probe can mount.
+      if (key === 'llmQuotaRetry') return options.poolService
       if (key === 'storage') {
         // The real accessor is the global storage HUB and its mounted domain
         // form, not the subtree-scoped `storageDomain` key. Model the hub so the
@@ -344,6 +361,7 @@ function harness(options = {}) {
       childIdCounter += 1
       const id = createOptions.sessionId
       child.id = id
+      child.session.id = id
       child.session.header.id = id
       child.options = createOptions.agentOptions ?? {}
       // One child object models one creation, so a new child starts whole.
@@ -1283,6 +1301,86 @@ check('maxActiveSubagents: a child that has finished holds no slot', async () =>
   })
   await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
   assert.equal(fake.storeRecords.size, 2, 'a finished child must not block new work')
+})
+
+check('config: a template fixes exactly one route, or names a pool', () => {
+  assert.equal(normalizeConfig({ templates: [POOLED_TEMPLATE] }).templates[0].pool, 'medium')
+  assert.equal(normalizeConfig({ templates: [TEMPLATES[0]] }).templates[0].provider, 'command-code-goat')
+  assert.throws(
+    () => normalizeConfig({ templates: [{ ...POOLED_TEMPLATE, provider: 'p', model: 'm' }] }),
+    /declares both `pool` and `provider`\/`model`/,
+  )
+  assert.throws(
+    () => normalizeConfig({ templates: [{ id: 'medium', name: 'Medium', description: 'x' }] }),
+    /declares neither a `pool` nor a `provider`\/`model` route/,
+  )
+  assert.throws(
+    () => normalizeConfig({ templates: [{ id: 'medium', name: 'Medium', description: 'x', provider: 'p' }] }),
+    /model must be a non-empty string, or name a `pool` instead/,
+  )
+  assert.throws(
+    () => normalizeConfig({ templates: [{ ...POOLED_TEMPLATE, pool: '   ' }] }),
+    /pool must be a non-empty string/,
+  )
+})
+
+check('a pool template resolves a route per child and assigns it that pool', async () => {
+  const assigned = []
+  const routes = [
+    { provider: 'first', model: 'one', reasoningEffort: 'low' },
+    { provider: 'second', model: 'two' },
+  ]
+  const poolService = {
+    pickRoute: async (pool) => {
+      assert.equal(pool, 'medium')
+      return routes.shift()
+    },
+    assignPool: (session, pool) => {
+      assigned.push([session.id, pool])
+      return true
+    },
+  }
+  const fake = await mount({ config: { templates: [POOLED_TEMPLATE] }, poolService })
+  await delegate(fake, { name: 'one', template: 'medium', prompt: 'look' }, false)
+  await delegate(fake, { name: 'two', template: 'medium', prompt: 'look' }, false)
+
+  const creates = fake.created.filter(entry => entry[0] === 'create').map(entry => entry[1])
+  assert.equal(creates[0].agentOptions.provider, 'first')
+  assert.equal(creates[0].agentOptions.model, 'one')
+  assert.equal(creates[0].agentOptions.reasoningEffort, 'low', 'the route\'s own effort wins')
+  assert.equal(creates[1].agentOptions.provider, 'second', 'each child resolves its own route')
+  assert.equal(creates[1].agentOptions.reasoningEffort, 'high', 'the template\'s effort is the fallback')
+  assert.deepEqual(assigned, [[creates[0].sessionId, 'medium'], [creates[1].sessionId, 'medium']])
+})
+
+check('a pool template without a route-pool service fails loud, creating nothing', async () => {
+  const fake = await mount({ config: { templates: [POOLED_TEMPLATE] } })
+  await assert.rejects(
+    () => delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false),
+    /names route pool "medium", but no route-pool service is mounted/,
+  )
+  assert.equal(fake.created.some(entry => entry[0] === 'create'), false)
+  assert.equal(fake.storeRecords.size, 0)
+})
+
+check('an unknown pool fails loud instead of delegating on a default model', async () => {
+  const fake = await mount({
+    config: { templates: [POOLED_TEMPLATE] },
+    poolService: { pickRoute: async () => undefined, assignPool: () => true },
+  })
+  await assert.rejects(
+    () => delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false),
+    /names route pool "medium", which the route-pool service does not define/,
+  )
+  assert.equal(fake.created.some(entry => entry[0] === 'create'), false)
+})
+
+check('list_subagent_templates reports a pool template without a fixed model', async () => {
+  const fake = await mount({ config: { templates: [POOLED_TEMPLATE, TEMPLATES[1]] } })
+  const text = await fake.tools.get('list_subagent_templates').execute({}, {})
+  assert.match(text, /route pool: medium \(a route with allowance is chosen for each subagent\)/)
+  assert.match(text, /model: opencode-go\/deepseek-v4-pro/)
+  assert.match(text, /agent preset: personal/)
 })
 
 let failed = 0
