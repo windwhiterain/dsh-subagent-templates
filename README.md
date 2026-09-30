@@ -357,8 +357,8 @@ names the ones it loses, and a template that declares neither keeps everything.
 
 An empty `allow` is a **lockout, not a no-op**: the child keeps no tool but the ones
 this plugin installs itself (`ask_parent`). A filter with neither `allow` nor `deny`
-fails the row, and the settings page refuses to write one that names no tool at all,
-so a lockout has to be written by hand.
+fails the row, and the page writes whatever the row accepts — so `{"allow": []}` is a
+valid, deliberate lockout, and the field's hint says what it does.
 
 The schema fills nothing in. An absent `toolFilter`, and an absent `allow` inside
 one, must stay absent: schemastery materializes an absent array as `[]`, so a

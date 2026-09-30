@@ -146,6 +146,9 @@ window.__ModuleLoader__.load({
       'invalid.id': 'id 不能为空。',
       'invalid.toolFilter': 'JSON 无效：{reason}',
       'invalid.toolFilterObject': '工具过滤必须是一个 JSON 对象，例如 {"deny":["write"]}。',
+      'invalid.toolFilterEmpty': '请至少指定一个工具名（allow 或 deny）。',
+      'invalid.toolFilterEntry': '工具名不能为空。',
+      'invalid.toolFilterKey': '工具过滤只支持 allow 和 deny。',
       'overridden': '已覆盖',
       'reset': '恢复出厂值',
       'resetField': '把这一项恢复为出厂值',
@@ -172,7 +175,7 @@ window.__ModuleLoader__.load({
       'template.maxTokens': '最大 token 数',
       'template.persona': 'persona',
       'template.toolFilter': '工具过滤（JSON）',
-      'template.toolFilterHint': '例如 {"deny":["write"]}。留空表示不过滤。',
+      'template.toolFilterHint': '例如 {"deny":["write"]}。留空表示保留全部工具；allow 为空则子智能体只剩 ask_parent。',
     }
 
     /** English copy of the settings page. */
@@ -199,6 +202,9 @@ window.__ModuleLoader__.load({
       'invalid.id': 'An id is required.',
       'invalid.toolFilter': 'Not valid JSON: {reason}',
       'invalid.toolFilterObject': 'The tool filter must be a JSON object, for example {"deny":["write"]}.',
+      'invalid.toolFilterEmpty': 'Name at least one tool in allow or deny.',
+      'invalid.toolFilterEntry': 'Blank tool names are not allowed.',
+      'invalid.toolFilterKey': 'A tool filter takes only allow and deny.',
       'overridden': 'Overridden',
       'reset': 'Restore',
       'resetField': 'Restore this field to the shipped value',
@@ -225,7 +231,7 @@ window.__ModuleLoader__.load({
       'template.maxTokens': 'Maximum tokens',
       'template.persona': 'Persona',
       'template.toolFilter': 'Tool filter (JSON)',
-      'template.toolFilterHint': 'For example {"deny":["write"]}. Blank means no filter.',
+      'template.toolFilterHint': 'For example {"deny":["write"]}. Blank keeps the whole tool set; an empty allow leaves the child nothing but ask_parent.',
     }
 
     /**
@@ -493,10 +499,58 @@ window.__ModuleLoader__.load({
       return value !== undefined && value >= minimum ? value : undefined
     }
 
+    /** The keys a tool filter may carry, matching the row's own normalizer. */
+    const TOOL_FILTER_KEYS = ['allow', 'deny']
+
+    /**
+     * Whether one side of a tool filter is a list of tool names.
+     *
+     * A blank entry is not a tool name, and a side that is not a list at all
+     * cannot carry names, so neither is usable: the row refuses both with one
+     * issue, "must be an array of non-empty tool names".
+     * @param value - one of the filter's `allow` or `deny` entries.
+     * @returns whether the value is a list whose every entry is a non-empty string.
+     */
+    function listsNames(value) {
+      return Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim() !== '')
+    }
+
+    /**
+     * The problem a parsed tool filter carries, if any, told apart by what the
+     * user has to fix.
+     *
+     * The row's normalizer is the authority, and this mirrors its three
+     * refusals exactly: a key it does not know, a side that is not a list of
+     * non-empty tool names, and a filter carrying neither side at all. A side
+     * that is present but empty is NOT refused, because the row accepts it as a
+     * deliberate lockout — a child left with no tools but the ones the plugin
+     * installs itself — and a page that refused it could not open a
+     * hand-written one at all.
+     *
+     * The unknown key comes first because it is a problem with the object
+     * itself, and the malformed side before the absent one because blanking an
+     * entry is a different repair from naming a side.
+     * @param filter - the parsed filter object.
+     * @returns the copy key of the problem, or undefined when the filter is
+     *   acceptable.
+     */
+    function toolFilterShapeProblem(filter) {
+      if (Object.keys(filter).some(key => !TOOL_FILTER_KEYS.includes(key))) return { key: 'invalid.toolFilterKey' }
+      const present = TOOL_FILTER_KEYS.filter(key => filter[key] !== undefined)
+      if (present.some(key => !listsNames(filter[key]))) return { key: 'invalid.toolFilterEntry' }
+      return present.length > 0 ? undefined : { key: 'invalid.toolFilterEmpty' }
+    }
+
     /**
      * The problem a tool-filter draft carries, if any. The text is JSON because
      * the field describes a filter object the schema declares, so an array or a
-     * bare string is as unusable as a syntax error.
+     * bare string is as unusable as a syntax error; a filter the row would
+     * refuse — an unknown key, a side that is not a list of non-empty tool
+     * names, or neither side at all — is refused here rather than by the Host's
+     * read, where it would leave the user looking at a save the row then
+     * rejected. A blank field is not one of these problems: it is how a template
+     * says the child keeps its whole tool set, and a present but empty side is
+     * the row's own lockout, which the page opens and saves as typed.
      * @param text - the draft text.
      * @returns the copy key and its parameters, or undefined when the draft is
      *   acceptable.
@@ -510,7 +564,8 @@ window.__ModuleLoader__.load({
       } catch (error) {
         return { key: 'invalid.toolFilter', params: { reason: String(error) } }
       }
-      return isRecord(parsed) ? undefined : { key: 'invalid.toolFilterObject' }
+      if (!isRecord(parsed)) return { key: 'invalid.toolFilterObject' }
+      return toolFilterShapeProblem(parsed)
     }
 
     /**

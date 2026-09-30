@@ -14,7 +14,10 @@
  * panel draws, the two actions, the refusal path, and the two ways a child stops
  * being listed. It then drives the settings page the same way: the registration
  * that follows the served namespace, the summary view, the editor the page
- * draws, and the operations every edit hands the stubbed form scope.
+ * draws, and the operations every edit hands the stubbed form scope. Its last
+ * settings check imports the row's own normalizer and drives one table of tool
+ * filter shapes through both sides, so the page's rules can only drift from the
+ * row's by failing.
  */
 
 import assert from 'node:assert/strict'
@@ -23,6 +26,9 @@ import { dirname, join } from 'node:path'
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { runInNewContext } from 'node:vm'
+// The row's own normalizer is the authority on what the row accepts, so the
+// filter-shape correspondence check below drives both sides from one table.
+import { normalizeConfig } from '../lib/config.js'
 
 /** The Harness checkout whose pnpm store holds React, react-dom, and jsdom. */
 const HARNESS = process.env.DSH_HARNESS_ROOT ?? 'C:/resource/deepseek-harness'
@@ -978,6 +984,131 @@ check('an invalid tool filter blocks the save and is reported inline', async () 
   assert.equal(writes.length, 0)
 })
 
+check('a tool filter with neither side blocks the save with its own message', async () => {
+  writes.length = 0
+  // The object is well-formed JSON, so this is not the syntax case: the row
+  // refuses a filter that carries neither side, and the page must say so before
+  // the save rather than let a write land on a value the row rejects.
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{}')
+  await act(async () => {})
+  assert.match(settingsContainer.textContent, /Name at least one tool in allow or deny\./)
+  assert.equal(settingsContainer.textContent.includes('Not valid JSON'), false)
+  assert.equal(saveButton(settingsContainer).disabled, true)
+  await save(settingsContainer)
+  assert.equal(writes.length, 0)
+
+  // One side present is enough, whichever side it is, even when the other side
+  // is present and empty: the row accepts that shape, so the page does.
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"allow":[],"deny":["write"]}')
+  await act(async () => {})
+  assert.equal(settingsContainer.textContent.includes('Name at least one tool'), false)
+})
+
+check('a tool filter whose list holds a blank name blocks the save with its own message', async () => {
+  writes.length = 0
+  // An empty string is not a tool name, even when the list is otherwise usable:
+  // the row refuses the filter, so the page refuses the save.
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"allow":["read",""],"deny":["write"]}')
+  await act(async () => {})
+  assert.match(settingsContainer.textContent, /Blank tool names are not allowed\./)
+  assert.equal(settingsContainer.textContent.includes('Name at least one tool'), false)
+  assert.equal(saveButton(settingsContainer).disabled, true)
+  await save(settingsContainer)
+  assert.equal(writes.length, 0)
+
+  // A blank name in `deny` alone, with `allow` fine, is refused just the same.
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"allow":["read"],"deny":["write",""]}')
+  await act(async () => {})
+  assert.match(settingsContainer.textContent, /Blank tool names are not allowed\./)
+  await save(settingsContainer)
+  assert.equal(writes.length, 0)
+
+  // A side that is a blank name and nothing else is the same repair, not a
+  // filter that named nothing.
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"deny":[""]}')
+  await act(async () => {})
+  assert.match(settingsContainer.textContent, /Blank tool names are not allowed\./)
+  await save(settingsContainer)
+  assert.equal(writes.length, 0)
+
+  // A side that is not a list at all cannot carry names either.
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"allow":"read"}')
+  await act(async () => {})
+  assert.match(settingsContainer.textContent, /Blank tool names are not allowed\./)
+  await save(settingsContainer)
+  assert.equal(writes.length, 0)
+})
+
+check('a tool filter with a key the row does not know blocks the save with its own message', async () => {
+  writes.length = 0
+  // The row refuses an unknown filter key with its own issue, so the page says
+  // which repair this is rather than letting the write land and be rejected.
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"allow":["read"],"foo":1}')
+  await act(async () => {})
+  assert.match(settingsContainer.textContent, /A tool filter takes only allow and deny\./)
+  assert.equal(saveButton(settingsContainer).disabled, true)
+  await save(settingsContainer)
+  assert.equal(writes.length, 0)
+
+  // An extra key beside an otherwise usable filter is the same repair.
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"deny":["write"],"extra":[]}')
+  await act(async () => {})
+  assert.match(settingsContainer.textContent, /A tool filter takes only allow and deny\./)
+  await save(settingsContainer)
+  assert.equal(writes.length, 0)
+})
+
+check('a tool filter the row accepts is written exactly as typed', async () => {
+  writes.length = 0
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"deny":["write"]}')
+  await act(async () => {})
+  await save(settingsContainer)
+  assert.equal(writes.length, 1)
+  assert.deepEqual(writes[0].ops[0].value[0].toolFilter, { deny: ['write'] })
+
+  writes.length = 0
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"allow":["read"]}')
+  await act(async () => {})
+  await save(settingsContainer)
+  assert.equal(writes.length, 1)
+  assert.deepEqual(writes[0].ops[0].value[0].toolFilter, { allow: ['read'] })
+
+  // Both sides, and a list of several names, are written as typed too.
+  writes.length = 0
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"allow":["read","grep"],"deny":["write"]}')
+  await act(async () => {})
+  assert.equal(settingsContainer.textContent.includes('Blank tool names'), false)
+  await save(settingsContainer)
+  assert.equal(writes.length, 1)
+  assert.deepEqual(writes[0].ops[0].value[0].toolFilter, { allow: ['read', 'grep'], deny: ['write'] })
+
+  // A present but empty side is the row's own lockout — a child left with
+  // nothing but ask_parent — so the page saves one as typed rather than
+  // refusing a filter a hand-written row may legitimately carry.
+  writes.length = 0
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '{"allow":[]}')
+  await act(async () => {})
+  assert.equal(settingsContainer.textContent.includes('Name at least one tool'), false)
+  assert.equal(saveButton(settingsContainer).disabled, false)
+  await save(settingsContainer)
+  assert.equal(writes.length, 1)
+  assert.deepEqual(writes[0].ops[0].value[0].toolFilter, { allow: [] })
+})
+
+check('a blank tool filter stays valid and writes no filter at all', async () => {
+  writes.length = 0
+  // Blank is how a template says "the child keeps its whole tool set" — the one
+  // case the row's schema must never fill in — so the written row omits the key.
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', '')
+  await act(async () => {})
+  assert.equal(settingsContainer.textContent.includes('Name at least one tool'), false)
+  assert.equal(settingsContainer.textContent.includes('Blank tool names'), false)
+  assert.equal(settingsContainer.textContent.includes('Not valid JSON'), false)
+  await save(settingsContainer)
+  assert.equal(writes.length, 1)
+  assert.equal('toolFilter' in writes[0].ops[0].value[0], false)
+})
+
 check('restoring the shipped defaults clears the three fields', async () => {
   writes.length = 0
   assert.equal(await clickButtonText(settingsContainer, 'Restore shipped defaults'), true)
@@ -1071,6 +1202,86 @@ check('a namespace the Host stops serving renders nothing at all', async () => {
   assert.equal(settingsContainer.textContent, '')
   await act(async () => { section.status = 'ready'; notifyScope() })
   assert.notEqual(settingsContainer.textContent, '')
+})
+
+// --- The page's filter rules against the row's own normalizer ------------------
+
+/**
+ * One template the row accepts unchanged, the carrier for every filter shape
+ * below: with everything else held fixed, the filter alone decides each verdict.
+ */
+const ROW_TEMPLATE = {
+  id: 'medium',
+  name: 'Medium',
+  description: 'Executes and explores.',
+  provider: 'command-code-goat',
+  model: 'deepseek/deepseek-v4.1-flash',
+}
+
+/**
+ * Every filter shape the page and the row are asked about, as the parsed value
+ * the page would write; `undefined` is the blank field, which the page omits
+ * from the write and the row therefore never sees.
+ */
+const FILTER_SHAPES = [
+  { label: 'an absent filter', value: undefined },
+  { label: 'a deny-only filter', value: { deny: ['write'] } },
+  { label: 'an allow-only filter', value: { allow: ['read'] } },
+  { label: 'an allow and a deny', value: { allow: ['read', 'grep'], deny: ['write'] } },
+  { label: 'an empty allow beside a deny', value: { allow: [], deny: ['write'] } },
+  { label: 'an empty filter', value: {} },
+  { label: 'an empty allow', value: { allow: [] } },
+  { label: 'a blank deny entry', value: { deny: [''] } },
+  { label: 'a blank entry beside a good one', value: { allow: ['read', ''], deny: ['write'] } },
+  { label: 'an allow that is not a list', value: { allow: 'read' } },
+  { label: 'an unknown key beside a good allow', value: { allow: ['read'], foo: 1 } },
+  { label: 'an unknown key beside a good deny', value: { deny: ['write'], extra: [] } },
+]
+
+/**
+ * What the page's rules say about one filter shape, read the way the editor
+ * decides it: the problem the field carries is what disables Save and draws the
+ * inline message.
+ * @param value - the parsed filter the page would write, or undefined for a blank field.
+ * @returns whether the page accepts the shape.
+ */
+async function pageAcceptsFilter(value) {
+  await typeInto(settingsContainer, 'dsst-template-0-toolFilter', value === undefined ? '' : JSON.stringify(value))
+  await act(async () => {})
+  return settingsStore.getSnapshot().templates[0].problems.toolFilter === undefined
+}
+
+/**
+ * What the row's normalizer says about the same shape, carried by a template it
+ * otherwise accepts.
+ * @param value - the parsed filter the page would write, or undefined when the row omits it.
+ * @returns whether `normalizeConfig` accepts the template carrying this filter.
+ */
+function rowAcceptsFilter(value) {
+  const template = { ...ROW_TEMPLATE }
+  if (value !== undefined) template.toolFilter = value
+  try {
+    normalizeConfig({ templates: [template] })
+    return true
+  } catch (_refused) {
+    return false
+  }
+}
+
+check('the page and the row agree on every tool-filter shape', async () => {
+  const disagreements = []
+  const table = []
+  for (const shape of FILTER_SHAPES) {
+    const page = await pageAcceptsFilter(shape.value)
+    const row = rowAcceptsFilter(shape.value)
+    table.push(`     ${row ? 'row accepts' : 'row refuses'}  ${page ? 'page accepts' : 'page refuses'}  ${shape.label}\n`)
+    if (page && !row) disagreements.push(`the page allows ${shape.label}, but the row refuses it`)
+    if (!page && row) disagreements.push(`the page blocks ${shape.label}, but the row accepts it`)
+  }
+  process.stdout.write(table.join(''))
+  // A page stricter than the row is as much a drift as a page looser than it:
+  // either way one side is deciding a filter shape the other disagrees with.
+  assert.deepEqual(disagreements, [])
 })
 
 check('unloading the settings surface withdraws the page, and disposing the plugin ends it', () => {
