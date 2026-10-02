@@ -98,7 +98,7 @@ mapping and naming:
 | This plugin | Replaces | What it does |
 | --- | --- | --- |
 | `list_subagents` | `list_agents` | this session's children, by name, with the template each runs under and whether it is `working`, `idle`, or `ended` |
-| `message_subagent` | `send_message` | sends to a child by name: a working one takes it at its next step, an idle one starts a new turn with it |
+| `message_subagent` | `send_message` | sends to a child by name: a working one takes it at its next step, an idle one starts a new turn with it — and the output that turn produces is reported back like the first one was |
 | `interrupt_subagent` | `interrupt_agent` | stops a child's current work and **keeps** it — session, transcript, and name all survive, so a message afterwards redirects it |
 
 `interrupt_subagent` and `delete_subagent` are the two ends of one decision:
@@ -454,28 +454,34 @@ being ignored.
 
 ## Results
 
-A **foreground** call waits for the child's turn to settle and returns its
-closing text as the tool result — that call's result and nothing else, because
-the parent is reading it there.
+A delegated child reports **every turn it finishes on its own terms**, not one
+result per delegation. What it produces is a conversation the parent can
+continue: `message_subagent` sends it more work, it runs another turn, and that
+turn's closing text reaches the parent the same way the first one did.
 
-A **background** call returns the child's name immediately and delivers the
-child's output to the parent as a `subagent-settled` notice when the child
-finishes on its own terms. An idle parent is woken; a busy one receives it at its
-next step. No collection call is involved.
+A **foreground** call waits for the child's first turn to settle and returns its
+closing text as the tool result. That one turn is the call's result and not also
+a notice, because the parent is reading it there. A later turn of the same child
+is a result nobody is reading anywhere else, so it is reported as a notice.
+
+A **background** call returns the child's name immediately, and every turn the
+child finishes afterwards arrives as a `subagent-settled` notice. An idle parent
+is woken; a busy one receives it at its next step. No collection call is
+involved.
 
 An **interrupted turn is not an outcome.** A user who stops a delegated child is
 redirecting it rather than ending the delegation: the child keeps its session and
-everything it had done, so a foreground call keeps waiting for it and a
-background watch stays armed. Whichever turn the child ends naturally is what
-reports — the foreground call's tool result, or a `subagent-settled` notice — and
-the interruption itself never fails a delegating call and never answers one. A
-child nothing wakes again leaves the wait pending on purpose; `delete_subagent`,
-or cancelling the delegating call, is what ends it.
+everything it had done, so a foreground call keeps waiting for it and the watch
+stays armed. Whichever turn the child ends naturally is what reports — the
+foreground call's tool result, or a `subagent-settled` notice — and the
+interruption itself never fails a delegating call and never answers one. A child
+nothing wakes again leaves the wait pending on purpose; `delete_subagent`, or
+cancelling the delegating call, is what ends it.
 
 Only a **natural end** is reported: `completed`, `max-tokens`, or the child's own
 failure. A turn the host refused admission to (`blocked`) and a turn that never
-ended are stops rather than results, so a background watch reports nothing for
-either; a deleted child reports nothing at all.
+ended are stops rather than results, so the watch reports nothing for either and
+stays armed for the turn that comes next; a deleted child reports nothing at all.
 
 ## Install
 

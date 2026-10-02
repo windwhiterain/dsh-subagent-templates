@@ -89,10 +89,10 @@ export async function apply(ctx, rawConfig) {
   const initial = normalizeConfig(rawConfig)
 
   /**
-   * Live background children, keyed by child session id. A template child is a
-   * root Session, so nothing in the host tracks it for us: this registry is the
-   * only thing that can end one on an explicit delete, which also ends the
-   * settlement watch that was waiting for its result.
+   * Live children, keyed by child session id. A template child is a root
+   * Session, so nothing in the host tracks it for us: this registry is the only
+   * thing that can end one on an explicit delete, which also ends the settlement
+   * watch still waiting for its next result.
    */
   const running = new Map()
 
@@ -137,7 +137,8 @@ export async function apply(ctx, rawConfig) {
   }
 
   /**
-   * Register one background child so an explicit end can reach it.
+   * Register one child so an explicit end can reach it, whichever route
+   * delegated it.
    * @param sessionId - the child session id.
    * @param parentSessionId - the delegating parent session id.
    * @param child - the child's Agent, owning handle, lifetime controller, and

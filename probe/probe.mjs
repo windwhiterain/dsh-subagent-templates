@@ -87,15 +87,23 @@ function harness(options = {}) {
   const requestResolvers = []
   let childIdCounter = 0
 
-  const childEvents = [
-    { type: 'user/message', data: {} },
-    { type: 'turn/start', data: { turn: 1 } },
-    {
-      type: 'assistant/message',
-      data: { message: { content: [{ type: 'text', text: options.answer ?? 'done' }] }, stream: [] },
-    },
-    { type: 'turn/end', data: { reason: { kind: options.stopKind ?? 'completed' } } },
-  ]
+  // The child's own log. A child runs turn after turn, and the log is the state
+  // that decides an outcome: what a settlement watch counts is how many turns
+  // have ended here, so a second turn has to be visible in it.
+  const turnLog = [{ type: 'user/message', data: {} }]
+  let turnCount = 0
+  /** The events one turn appends, closing with the text it answered. */
+  const turnEvents = (answer) => {
+    turnCount += 1
+    return [
+      { type: 'turn/start', data: { turn: turnCount } },
+      {
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: answer }] }, stream: [] },
+      },
+      { type: 'turn/end', data: { reason: { kind: options.stopKind ?? 'completed' } } },
+    ]
+  }
   /** The cause the child's turn was cancelled with, or null while it is whole. */
   let cancelled = null
   // `deferredIdle` holds a child's turn open until something stops it, which is
@@ -143,8 +151,8 @@ function harness(options = {}) {
       // A cancelled turn ends `aborted`, which is what makes a stopped child an
       // external stop rather than a finished one.
       snapshotEvents: () => (cancelled === null
-        ? childEvents
-        : childEvents.map(event => (event.type === 'turn/end'
+        ? turnLog
+        : turnLog.map(event => (event.type === 'turn/end'
           ? { type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: cancelled } } } }
           : event))),
     },
@@ -163,7 +171,16 @@ function harness(options = {}) {
       },
       on: (event, listener) => { listeners.set(`child:${event}`, listener); return () => {} },
     },
-    followup: (message) => { created.push(['followup', message.content[0].text]) },
+    followup: (message) => {
+      created.push(['followup', message.content[0].text])
+      // The turn this opens is in the log by the time anything reads it, as a
+      // real child's is. Whether the Agent is still working on it is a separate
+      // fact: `deferredIdle` holds the turn open, and otherwise it is already
+      // over — answered, and idle, which is what leaves a watch waiting for the
+      // next turn rather than reporting the same one again.
+      turnLog.push(...turnEvents(options.answer ?? 'done'))
+      if (options.deferredIdle !== true) child.status = 'idle'
+    },
     whenIdle: options.whenIdle === 'never'
       ? () => new Promise(() => {})
       : options.deferredIdle === true ? () => idlePromise : async () => {},
@@ -415,15 +432,18 @@ function harness(options = {}) {
   /**
    * Model the child starting another turn and ending it naturally.
    *
-   * The state that decides an outcome is the log, not a flag: clearing the
-   * cancellation cause is what makes `snapshotEvents()` report a completed turn
-   * again, and the status transition is what a watcher waiting for the child's
-   * next turn is armed on. Both happen here, in that order.
+   * The state that decides an outcome is the log, not a flag: appending this
+   * turn is what makes it reportable, clearing the cancellation cause is what
+   * makes `snapshotEvents()` report it as completed, and the status transition is
+   * what a watcher waiting for the child's next turn is armed on. All three
+   * happen here, in that order.
+   * @param answer - the closing text this turn answers with.
    */
-  const resumeChild = () => {
+  const resumeChild = (answer = options.answer ?? 'done') => {
     cancelled = null
     child.status = 'running'
     listeners.get('child:agent/status')?.({ agent: child, status: 'running' })
+    turnLog.push(...turnEvents(answer))
     child.status = 'idle'
   }
 
@@ -591,6 +611,9 @@ check('list_subagents reports each child by name, template, and work', async () 
   const fake = await mountWithChild()
   const tool = fake.parentTools.get('list_subagents')
   const signal = new AbortController().signal
+  // The child's turn is over by now, so what is being checked here is the other
+  // state a child can be in: one whose turn is still open.
+  fake.child.status = 'running'
   const rows = await tool.execute({}, { agent: fake.parent, signal })
   assert.deepEqual(rows, [{ name: 'explorer', template: 'medium', status: 'working' }])
   // The row is drawn for a model, so it is text a model can act on.
@@ -964,6 +987,51 @@ check('background: a stopped child is waited through, and its next turn is repor
   assert.equal(message.content[0].text, 'subagent "explorer" finished.')
 })
 
+check('background: a child that already reported keeps reporting what it does next', async () => {
+  // The regression this guards: a watch that answered for one turn used to be
+  // spent, so everything the child did after that — a message from the parent, a
+  // message from the user in the child's own session — ran to completion with
+  // nobody reading it.
+  const fake = await mount({ parentStatus: 'running' })
+  await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  await until(() => fake.delivered.length === 1, 'the first turn reports')
+  const [, first] = fake.delivered[0]
+  assert.equal(first.content[0].text, 'subagent "explorer" finished.')
+
+  // The parent sends the child more work, and the child runs another turn.
+  const sent = await fake.parentTools.get('message_subagent').execute(
+    { name: 'explorer', message: 'now check the tests' },
+    { agent: fake.parent, signal: new AbortController().signal },
+  )
+  assert.deepEqual(sent, { name: 'explorer', status: 'delivered' })
+  fake.resumeChild('the tests pass')
+  await until(() => fake.delivered.length === 2, 'the second turn reports too')
+  const [, second] = fake.delivered[1]
+  assert.equal(second.source.kind, 'subagent-settled')
+  assert.equal(second.content[0].text, 'subagent "explorer" finished.')
+  // The text that came back is this turn's own, not the first turn's again.
+  assert.ok(second.content.some(block => block.text === 'the tests pass'))
+  assert.equal(second.content.some(block => block.text === 'done'), false)
+
+  // And the watch does not report one turn twice.
+  await tick()
+  assert.equal(fake.delivered.length, 2, 'a settled turn is reported once')
+})
+
+check('foreground: a later turn of the same child reports too', async () => {
+  // The delegation's result is the turn this call waited for. A turn the parent
+  // starts afterwards is a result nobody is reading anywhere else.
+  const fake = await mount({ parentStatus: 'running' })
+  const value = await delegate(fake, { name: 'reviewer', template: 'high', prompt: 'look' }, false)
+  assert.equal(value.output[0].text, 'done')
+  assert.equal(fake.delivered.length, 0, 'the awaited turn is the result, not a notice')
+  fake.resumeChild('a second opinion')
+  await until(() => fake.delivered.length === 1, 'the next turn reports')
+  const [, message] = fake.delivered[0]
+  assert.equal(message.content[0].text, 'subagent "reviewer" finished.')
+  assert.ok(message.content.some(block => block.text === 'a second opinion'))
+})
+
 check('background: deleting the child ends its settlement watch', async () => {
   const fake = await mount({ parentStatus: 'running', deferredIdle: true })
   await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
@@ -1007,8 +1075,9 @@ check('foreground: the result is the tool result and nothing else', async () => 
   const fake = await mount({ parentStatus: 'running' })
   const value = await delegate(fake, { name: 'reviewer', template: 'high', prompt: 'look' }, false)
   assert.equal(value.output[0].text, 'done')
-  // The parent reads this result here, so a notice too would be the same answer
-  // twice. Only a background call has nobody reading a result.
+  // The parent reads this turn's result here, so a notice for the same turn would
+  // be the same answer twice. A LATER turn of the same child is a different
+  // result, and it is reported.
   assert.equal(
     fake.delivered.some(([, message]) => message.source?.kind === 'subagent-settled'),
     false,
