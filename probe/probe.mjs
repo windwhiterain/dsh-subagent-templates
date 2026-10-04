@@ -872,7 +872,7 @@ check('background: a naturally finished child names itself to a busy parent', as
     name: 'explorer', template: 'medium', prompt: 'look',
   }, true)
   await new Promise(resolve => setImmediate(resolve))
-  const [, message] = fake.delivered.find(([what]) => what === 'inject')
+  const [, message] = fake.delivered.find(([what]) => what === 'steer')
   assert.equal(message.source.kind, 'subagent-settled')
   assert.equal(message.source.senderSessionId, fake.child.id)
   assert.equal(message.content[0].text, 'subagent "explorer" finished.')
@@ -881,11 +881,27 @@ check('background: a naturally finished child names itself to a busy parent', as
   assert.ok(message.content.some(block => block.text === 'done'))
 })
 
+check('background: a busy parent is steered, never left holding an unwoken notice', async () => {
+  // The regression this guards: the notice used to go in as `inject`, which fills
+  // the same inbox slot but does NOT wake the driver. A parent whose turn ends
+  // before its next step then parks it — unread by the model, invisible in the
+  // Client, and discardable by a cancellation or a disposal. Steering is the
+  // route the Harness's own subagent service takes.
+  const fake = await mount({ parentStatus: 'running' })
+  await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  await new Promise(resolve => setImmediate(resolve))
+  const lanes = fake.delivered.map(([what]) => what)
+  assert.deepEqual(lanes, ['steer'], 'a busy parent is steered, which wakes it')
+  assert.equal(lanes.includes('inject'), false, 'an unwoken notice can be parked forever')
+})
+
 check('background: an idle parent is woken', async () => {
   const fake = await mount({ parentStatus: 'idle' })
   await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
   await new Promise(resolve => setImmediate(resolve))
-  assert.ok(fake.delivered.some(([what]) => what === 'followup'))
+  // An idle driver starts a turn with a steered message, so the notice is the
+  // thing that gets it working again.
+  assert.ok(fake.delivered.some(([what]) => what === 'steer'))
 })
 
 check('a child is not bound to the calling tool\'s signal', async () => {
