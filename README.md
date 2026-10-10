@@ -195,16 +195,25 @@ Two consequences worth stating plainly:
 
 - **They appear in the session's *next* model request.** The delegation already
   happened; a tool cannot appear in a request that is already in flight.
-- **They are never withdrawn again.** A session that has delegated may delegate
-  again at any point, and after its last child is gone they answer honestly
-  (`(no subagents)`, `unknown`) rather than the session having to earn them a
-  second time. That is also the only way `list_subagents` can report nothing.
+- **They are never withdrawn while the plugin runs.** A session that has delegated
+  may delegate again at any point, and after its last child is gone they answer
+  honestly (`(no subagents)`, `unknown`) rather than the session having to earn
+  them a second time. That is also the only way `list_subagents` can report
+  nothing.
 
-A hot reload replaces this plugin and loses every scope it adopted while the
-children it recorded are still in the store, so activation adopts the live
-sessions that already have children — found through the Agent registry and the
-mapping store. Without that, a reloaded session would keep working and silently
-have no way to manage what it delegated.
+A hot reload replaces this plugin while the children it recorded are still in the
+store, so activation adopts the live sessions that already have children — found
+through the Agent registry and the mapping store. Without that, a reloaded session
+would keep working and silently have no way to manage what it delegated.
+
+Those four tools live in the **Agent's** scope rather than this plugin's, so they
+outlive the instance that registered them and the teardown that ends an instance
+has to withdraw them itself. A scope refuses two registrations of one name, so an
+instance that left a stale registration behind would make its replacement adopt
+nothing — and leave the session calling tools bound to the closed mapping domain.
+Adoption therefore keeps the registration's own disposer and runs it on unload,
+and a registration the scope refuses leaves the session unmarked, so a later
+delegation may adopt instead of the session losing the tools for good.
 
 ## The panel
 

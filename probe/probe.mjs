@@ -12,8 +12,9 @@
  * parentSession, the name that titles it, the template's preset and route, the
  * initial model selection the user can override), the caller's own choice of
  * foreground or background, name uniqueness, foreground and background
- * settlement, the external-stop silence rule, the parent/child store, and
- * configuration rejection.
+ * settlement, the external-stop silence rule, the parent/child store, the reload
+ * that withdraws a session's adopted tools and lets its replacement register
+ * them again, and configuration rejection.
  */
 
 import assert from 'node:assert/strict'
@@ -49,6 +50,37 @@ const POOLED_TEMPLATE = {
   description: 'Executes and explores.',
   pool: 'medium',
   reasoningEffort: 'high',
+}
+
+/**
+ * The tool scope one Agent owns, created once and kept for the Agent's whole life.
+ *
+ * A reload replaces the plugin, never the Agent, so what one instance registers
+ * here is what its replacement finds — and a scope refuses two registrations of
+ * one name, which is what turns a stale registration into a failed adoption.
+ * @param agent - the Agent whose scope this is.
+ * @returns that Agent's tool scope, keyed by tool name.
+ */
+function scopeTools(agent) {
+  agent.toolScope ??= new Map()
+  return agent.toolScope
+}
+
+/**
+ * The tool registry one Agent's scope answers with, over that Agent's own scope.
+ * @param agent - the Agent whose scope this is.
+ * @returns its scoped registry surface.
+ */
+function toolApi(agent) {
+  const tools = scopeTools(agent)
+  return {
+    register: (definition) => {
+      if (tools.has(definition.name)) throw new Error(`duplicate scoped tool ${definition.name}`)
+      tools.set(definition.name, definition)
+      return () => tools.delete(definition.name)
+    },
+    get: (toolName) => tools.get(toolName),
+  }
 }
 
 /**
@@ -199,29 +231,6 @@ function harness(options = {}) {
   // The parent's own agent scope, the way the harness hands every live Agent a
   // context of its own. Tools registered here belong to this session alone, which
   // is what "only after a spawn" is made of.
-  const parentTools = new Map()
-  const scopedToolApi = {
-    register: (definition) => {
-      if (parentTools.has(definition.name)) throw new Error(`duplicate scoped tool ${definition.name}`)
-      parentTools.set(definition.name, definition)
-      return () => parentTools.delete(definition.name)
-    },
-    get: (toolName) => parentTools.get(toolName),
-  }
-
-  /** The agent-scoped context the harness hands one live Agent. */
-  function agentScope() {
-    return {
-      get: (key) => (key === 'tools' ? scopedToolApi : undefined),
-      inject: (deps, callback) => {
-        const injected = { get: (key) => (key === 'tools' ? scopedToolApi : undefined) }
-        for (const dep of deps) injected[dep] = injected.get(dep)
-        callback(injected)
-        return { dispose: async () => {} }
-      },
-    }
-  }
-
   const parent = {
     id: 'parent-1',
     options: { provider: 'p', model: 'm' },
@@ -230,17 +239,45 @@ function harness(options = {}) {
     followup: (message) => { delivered.push(['followup', message]) },
     inject: (message) => { delivered.push(['inject', message]) },
     steer: (message) => { delivered.push(['steer', message]) },
-    ctx: agentScope(),
+  }
+  parent.ctx = agentScope(parent)
+  // The scope is a property of the AGENT, not of the instance that registered into
+  // it: an Agent outlives every plugin instance, so what one instance leaves there
+  // is what the next one finds — which is the whole difficulty a reload has.
+  const parentTools = scopeTools(parent)
+
+  /** The agent-scoped context the harness hands one live Agent. */
+  function agentScope(agent) {
+    const scopedToolApi = toolApi(agent)
+    return {
+      get: (key) => (key === 'tools' ? scopedToolApi : undefined),
+      // Cordis activates an injected callback only after the fiber's first await,
+      // and contains a callback that throws by logging it. Both matter here: the
+      // plugin captures a disposer across this call, and a registration this scope
+      // refuses must not take the probe down with it.
+      inject: (deps, callback) => {
+        const injected = { get: (key) => (key === 'tools' ? scopedToolApi : undefined) }
+        for (const dep of deps) injected[dep] = injected.get(dep)
+        queueMicrotask(() => {
+          try {
+            callback(injected)
+          } catch (error) {
+            errors.push(String(error))
+          }
+        })
+        return { dispose: async () => {} }
+      },
+    }
   }
 
   // The real registry holds every live Agent, which is how a template child is
   // found: it is a root Session, so nothing else knows it exists. `liveAgents`
   // seeds it, which is how a hot reload is modelled: the Agents belong to the
   // host, not to the plugin, so they survive the plugin being replaced — and so
-  // does their tool scope, which is re-pointed at this instance's registry here.
+  // does their tool scope, which this fake reaches through the Agent itself.
   const live = new Map([[parent.id, parent]])
   for (const agent of options.liveAgents ?? []) {
-    agent.ctx = agentScope()
+    agent.ctx = agentScope(agent)
     live.set(agent.id, agent)
   }
   const registry = { get: id => live.get(id) }
@@ -594,17 +631,29 @@ check('a reloaded instance adopts the live sessions that already have children',
   // The first instance records a child, then goes away through its own disposers.
   const first = await mount()
   await delegate(first, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
-  assert.equal(first.parentTools.size, 4)
+  // The scope belongs to the Agent, so it is the same map every instance reaches.
+  const scope = first.parentTools
+  assert.equal(scope.size, 4)
+  const adopted = scope.get('list_subagents')
   for (const entry of first.disposers) await entry.dispose?.()
+  // Its teardown withdraws what it adopted. The tools live in the Agent's scope,
+  // which no plugin instance owns, so nothing else would ever take them back —
+  // and a name they still held is one the replacement could not register over.
+  assert.equal(scope.size, 0, 'a teardown releases the tools it installed')
 
   // The replacement runs on a host whose Agents are the same Agents — only the
   // plugin is new — and finds that session through the registry and the store, so
   // a reloaded session does not have to delegate again to get its tools back.
   const second = harness({ liveAgents: [first.parent], shared: { storeRecords: first.storeRecords } })
   await apply(second.ctx, { templates: TEMPLATES })
-  assert.deepEqual([...second.parentTools.keys()].sort(), [
+  // Adoption registers through `ctx.inject`, whose callback lands a microtask after
+  // apply returns — the session's next model request is what carries the tools.
+  await until(() => scope.size === 4, 'the replacement adopted the session')
+  assert.deepEqual([...scope.keys()].sort(), [
     'delete_subagent', 'interrupt_subagent', 'list_subagents', 'message_subagent',
   ])
+  assert.notEqual(scope.get('list_subagents'), adopted, 'the session holds the replacement\'s tools')
+  assert.deepEqual(second.errors, [], 'the replacement registered instead of colliding with the stale tools')
 })
 
 check('list_subagents reports each child by name, template, and work', async () => {
@@ -1379,14 +1428,20 @@ check('a reload waits out the previous instance instead of adopting a domain it 
   const mounting = apply(second.ctx, { templates: TEMPLATES })
   // The previous instance's teardown lands while the new one is waiting.
   await new Promise(resolve => setTimeout(resolve, 30))
+  // That teardown runs every disposer at once, and the one that withdraws the
+  // four adopted tools is also the one that closes the domain. So a replacement
+  // reaches its own adoption — which cannot happen before the domain opens — with
+  // the scope already clear, which is what this whole reload ordering rests on.
   for (const { dispose } of [...first.disposers].reverse()) {
     try { await dispose?.() } catch { /* a reload's teardown is best-effort */ }
   }
   await mounting
+  await until(() => first.parentTools.size === 4, 'the replacement adopted the session during its own mount')
 
   assert.equal(first.facility.reserved.has('subagent_templates'), true,
     'the reloaded instance holds its own reservation, not the closed one')
   assert.equal(second.storeRecords.size, 1, 'the mapping survived the reload')
+  assert.deepEqual(second.errors, [], 'the replacement adopted without colliding with stale tools')
   await delegate(second, { name: 'y', template: 'medium', prompt: 'look' }, false)
   assert.equal(second.storeRecords.size, 2, 'the reloaded instance still records mappings')
 })

@@ -220,23 +220,46 @@ export async function apply(ctx, rawConfig) {
 
   /**
    * Install the child-management tools into one session's own scope, at most once.
+   *
+   * `ctx.inject` runs its callback only after the fiber's first await, so the
+   * registrations exist a microtask after this returns: the entry keeps a holder
+   * whose `dispose` is filled in then. Capturing the assignment's result instead
+   * would keep the placeholder, and the session's four tools would never be
+   * withdrawn — leaving a reload's replacement to collide with them, because a
+   * scope refuses two registrations of one name.
+   *
+   * A registration this scope refuses leaves the session unmarked, so a later
+   * delegation can take the tools rather than the session losing them for good.
    * @param parent - the delegating parent Agent.
    */
   const adoptChildTools = (parent) => {
     if (childToolScopes.has(parent.id)) return
-    let disposeTools = () => {}
+    // Reserve before the deferred registration runs, so two delegations in one
+    // turn do not both adopt this session.
+    const holder = { dispose: () => {} }
+    childToolScopes.set(parent.id, holder)
     parent.ctx.inject(['tools'], (toolCtx) => {
-      const disposers = [
-        toolCtx.tools.register(createSubagentListTool(control)),
-        toolCtx.tools.register(createSubagentMessageTool(control)),
-        toolCtx.tools.register(createSubagentInterruptTool(control)),
-        toolCtx.tools.register(createDeleteSubagentTool({ store, deleteChild })),
-      ]
-      disposeTools = () => {
-        for (const dispose of disposers.reverse()) dispose()
+      let disposers
+      try {
+        disposers = [
+          toolCtx.tools.register(createSubagentListTool(control)),
+          toolCtx.tools.register(createSubagentMessageTool(control)),
+          toolCtx.tools.register(createSubagentInterruptTool(control)),
+          toolCtx.tools.register(createDeleteSubagentTool({ store, deleteChild })),
+        ]
+      } catch (error) {
+        childToolScopes.delete(parent.id)
+        throw error
       }
+      holder.dispose = () => {
+        for (const dispose of disposers) dispose()
+      }
+      // This instance's teardown clears the entry before it closes the store, so a
+      // registration that lands after that unload must not outlive it: the tools
+      // would answer from a closed mapping domain, which is the state a replacement
+      // can no longer repair.
+      if (!childToolScopes.has(parent.id)) holder.dispose()
     })
-    childToolScopes.set(parent.id, disposeTools)
   }
 
   // A hot reload replaces this instance and loses every scope it adopted, while
@@ -337,7 +360,7 @@ export async function apply(ctx, rawConfig) {
   // nothing else would take them back — but it deliberately leaves live children
   // running: a code reload must never destroy a subagent mid-task.
   ctx.effect(() => async () => {
-    for (const dispose of childToolScopes.values()) dispose()
+    for (const holder of childToolScopes.values()) holder.dispose()
     childToolScopes.clear()
     await store?.close()
   })
