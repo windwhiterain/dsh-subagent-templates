@@ -1510,7 +1510,7 @@ check('an unknown pool fails loud instead of delegating on a default model', asy
 check('list_subagent_templates reports a pool template without a fixed model', async () => {
   const fake = await mount({ config: { templates: [POOLED_TEMPLATE, TEMPLATES[1]] } })
   const text = await fake.tools.get('list_subagent_templates').execute({}, {})
-  assert.match(text, /route pool: medium \(a route with allowance is chosen for each subagent\)/)
+  assert.match(text, /route pool: medium \(a route with allowance is drawn for each subagent\)/)
   assert.match(text, /model: opencode-go\/deepseek-v4-pro/)
   assert.match(text, /agent preset: personal/)
 })

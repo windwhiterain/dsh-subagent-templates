@@ -333,10 +333,11 @@ A template fixes **exactly one** of:
   empty.
 - `pool` — the name of a route pool owned by
   [`dsh-llm-quota-retry`](https://github.com/windwhiterain/dsh-llm-quota-retry).
-  The route is resolved **per child**, right before that child exists, from the
-  pool's ordered routes, skipping the ones whose provider is out of allowance. So
-  two subagents of one template can start on different providers, and a template
-  is how a session says "any of these will do, pick one that works".
+  The route is resolved **per child**, right before that child exists: the pool
+  skips the routes whose provider is out of allowance and draws one of the rest
+  in proportion to what each has left. So two subagents of one template start on
+  different providers, and a template is how a session says "any of these will
+  do, spread the work across them, and pick one that works".
 
 Declaring both, or neither, fails the row at activation. A `pool` template whose
 service is not mounted, or whose pool that service does not define, fails the
