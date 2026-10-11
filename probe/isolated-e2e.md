@@ -138,13 +138,18 @@ the `subagent` call carrying the child's text, plus the absence of the
    omitted background flag, which the schema requires — and its `tool/result` for
    that call carries the child's own final assistant text.
 3. With `run_in_background: true` on the call, the parent's log gains a
-   `user/message` whose `data.source.kind` is `subagent-settled`, opening with
-   `subagent "<name>" finished.` and carrying the child's closing text, with no
-   `job_output`/`send_message`/`list_agents` collection call before it. A template
+   `user/message` opening with `subagent "<name>" finished.` and carrying the
+   child's closing text, with no `job_output`/`send_message`/`list_agents`
+   collection call before it. Identify it by `data.source.senderSessionId`, which
+   is the child's session id — not by `data.source.kind`, because a notice that
+   joins a turn already running claims `user` so the Client draws it as a visible
+   row rather than as injected context (see "Every message takes the route the
+   recipient's own state requires" in the README). A notice delivered to an idle
+   parent is queued as a turn of its own and keeps `subagent-settled`. A template
    alone never makes a call run in the background.
 4. With the child's own turn interrupted — the user's stop button, or the
    teardown case below — the process still exits 0 and the parent log has **no**
-   `subagent-settled` notice for that turn: an interruption is not an outcome, so
+   notice for that turn: an interruption is not an outcome, so
    the watch it leaves behind reports nothing. A run that then starts the child's
    *next* turn (a `message_subagent` call, or a user message in the child's own
    session) must report **that** turn's text, under the same child name: an

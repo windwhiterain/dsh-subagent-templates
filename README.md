@@ -142,12 +142,11 @@ In the child's creation window the plugin registers, **on the child's own
 scope** so no other Session ever sees it:
 
 - **`ask_parent`** — send the delegating session a question or a finding. The
-  message is delivered exactly as a subagent's message is: the parent receives
-  it at its next step (an idle parent is woken). It carries the same
-  `agent-message` attribution, so the transcript shows who asked — the header
-  opens `subagent "<name>" sent a message:`, naming the child rather than its
-  Session id, and the attribution's own `senderSessionId` keeps the sending
-  Session identifiable. There is no
+  parent receives it at its next step, and an idle parent is woken by it. It
+  carries the same `agent-message` attribution, so the transcript shows who
+  asked — the header opens `subagent "<name>" sent a message:`, naming the child
+  rather than its Session id, and the attribution's own `senderSessionId` keeps
+  the sending Session identifiable. There is no
   reply inside the child's turn, so the tool's own description asks for a
   question the parent can answer in one go.
 - **a runtime context** naming the parent Session and explaining the channel:
@@ -162,6 +161,58 @@ plainly that this route cannot reach the delegating Session. It is deliberately
 preset), which creates a *continuable* child, and `send_message` is the working
 route to that one. Denying it on every child would remove a capability that
 works.
+
+## Every message takes the route the recipient's own state requires
+
+`ask_parent`, `message_subagent` and the settlement notice all travel through one
+channel (`lib/delivery.js`), and it chooses between two routes on what the
+receiving Session is doing at that moment. What it chooses is not a preference:
+one route is readable in the Client and the other is not.
+
+**An idle recipient is queued the message as a turn of its own.** The message
+keeps its own source — `agent-message` for a question, `subagent-settled` for a
+notice — because a delivery that opens a turn is already drawn as a visible turn
+trigger under that source, with the icon and title that name who sent it.
+
+**A recipient that is already working takes the message at its next step**, and
+that delivery is spliced into a turn that is already running. The Web Chat draws
+a message whose source is not `user` as *injected context*, and a context row is
+not one of its visible rows — so the message would be read by the model and seen
+by nobody. A mid-turn delivery therefore claims `user`, which is what makes it a
+visible in-turn row. This is the same rule the office plugin follows for the
+same reason.
+
+The disguise is only the source's `kind`. Everything else about the message is
+unchanged: the model-visible content, the durable `MessageId`, and every other
+field on the source, including the `senderSessionId` that records who sent it. No
+`rpcId` is written — the browser's prompt admission is the only writer of that
+field, and a message without one is not read as a human instruction by anything
+downstream.
+
+### A failed turn does not swallow a message
+
+Before every proposed step the Harness claims the recipient's whole inbox batch
+as a durable deletion, and the batch is written back into the log as
+`user/message` only once the request for that step is being prepared. Anything
+that fails in between — a pre-step listener, a route that will not resolve, a
+full disk — ends the turn with the batch claimed and never logged. The message is
+then absent from the log *and* absent from the inbox, and the next turn the
+recipient runs has no idea it was ever sent: continuing it would go on without
+the finding.
+
+The channel remembers what it handed over and watches the recipient's own log for
+the message the model was actually shown. When a turn ends in `error` or in
+`blocked` — a refusal that discarded the batch it had claimed — anything it is
+still holding that is neither logged nor queued is put back and delivered again.
+It is put back after the recipient goes idle, so the replacement is the first
+thing the next turn claims rather than one the driver has already decided not to
+start a turn for. A message the failed turn never claimed is still queued and is
+left alone.
+
+A **cancellation is deliberately not repaired.** A stop is somebody deciding this
+work should not continue; putting the message back into it would override that
+decision rather than repair a failure. A message is put back at most three
+times, after which it is dropped with a warning rather than retried forever.
 
 ## What it mounts
 
@@ -475,9 +526,8 @@ a notice, because the parent is reading it there. A later turn of the same child
 is a result nobody is reading anywhere else, so it is reported as a notice.
 
 A **background** call returns the child's name immediately, and every turn the
-child finishes afterwards arrives as a `subagent-settled` notice. An idle parent
-is woken; a busy one receives it at its next step. No collection call is
-involved.
+child finishes afterwards arrives as a `subagent-settled` notice. No collection
+call is involved.
 
 An **interrupted turn is not an outcome.** A user who stops a delegated child is
 redirecting it rather than ending the delegation: the child keeps its session and
@@ -590,6 +640,13 @@ rather than a second route to the same children.
   bundle cannot import. A Harness upgrade that changes the final-output
   selection rule or the turn-end vocabulary must be reflected there. The file
   names its sources.
+- **The `user` a mid-turn message claims is a rendering decision, not an
+  identity one.** A consumer that tells a human's own words from another agent's
+  by `source.kind` alone now reads a child's mid-turn message as the former. What
+  keeps that bounded today is that those consumers also require an `rpcId`, and
+  only browser prompt admission writes one — a Harness change that dropped that
+  requirement would turn this into a real authority question rather than a naming
+  one. The durable `senderSessionId` on the same source is unaffected.
 - **The client half has no bundler.** `client.js` is served as one classic script,
   so it imports nothing, reaches React and the shared primitives through the
   module system's `require`, and injects its own stylesheet from `--dsw-*` tokens

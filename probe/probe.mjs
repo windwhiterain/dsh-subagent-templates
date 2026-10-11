@@ -172,10 +172,20 @@ function harness(options = {}) {
     restrict: (restriction) => { created.push(['restrict', restriction]) },
   }
 
+  // The two live Agents' pending inboxes. The delivery channel reads them to tell
+  // a message a failed turn never claimed — still queued, and fine — from one it
+  // did claim and never logged, which is gone from the log and from here.
+  const childInbox = { nextTurn: [], nextStep: [] }
+  const parentInbox = { nextTurn: [], nextStep: [] }
+
   const child = {
     id: '',
     options: {},
-    steer: (message) => { created.push(['child.steer', message]) },
+    inbox: childInbox,
+    steer: (message) => {
+      childInbox.nextStep.push(message)
+      created.push(['child.steer', message])
+    },
     session: {
       id: '',
       header: { id: '' },
@@ -204,6 +214,7 @@ function harness(options = {}) {
       on: (event, listener) => { listeners.set(`child:${event}`, listener); return () => {} },
     },
     followup: (message) => {
+      childInbox.nextTurn.push(message)
       created.push(['followup', message.content[0].text])
       // The turn this opens is in the log by the time anything reads it, as a
       // real child's is. Whether the Agent is still working on it is a separate
@@ -236,9 +247,17 @@ function harness(options = {}) {
     options: { provider: 'p', model: 'm' },
     session: { header: { id: 'parent-1', cwd: options.cwd ?? 'C:/work' } },
     status: options.parentStatus ?? 'running',
-    followup: (message) => { delivered.push(['followup', message]) },
+    inbox: parentInbox,
+    whenIdle: async () => {},
+    followup: (message) => {
+      parentInbox.nextTurn.push(message)
+      delivered.push(['followup', message])
+    },
     inject: (message) => { delivered.push(['inject', message]) },
-    steer: (message) => { delivered.push(['steer', message]) },
+    steer: (message) => {
+      parentInbox.nextStep.push(message)
+      delivered.push(['steer', message])
+    },
   }
   parent.ctx = agentScope(parent)
   // The scope is a property of the AGENT, not of the instance that registered into
@@ -484,10 +503,28 @@ function harness(options = {}) {
     child.status = 'idle'
   }
 
+  /**
+   * Model the receiving Session claiming a message and then failing before it
+   * is logged, which is what the Harness does when a turn breaks between the
+   * claim and the request: the message leaves the inbox and never reaches the
+   * log, so nothing the recipient runs afterwards knows it was ever sent.
+   * @param kind - the turn-end reason the failed turn records.
+   */
+  const dropClaimedFromParent = (kind) => {
+    parentInbox.nextStep.length = 0
+    // The turn is over, so the parent is idle again — the state the channel
+    // waits for before it decides what to do with what it is holding.
+    parent.status = 'idle'
+    listeners.get('session/event')?.(parent.session, {
+      type: 'turn/end',
+      data: { reason: { kind } },
+    })
+  }
+
   return {
     ctx, parent, child, agentsApi, tools, parentTools, childTools, listeners, disposers, created, attached,
     delivered, warnings, errors, settingsPresentations, store, storeRecords, requestResolvers, archived, renamed, projections, execSignal: undefined,
-    facility, root, resumeChild,
+    facility, root, resumeChild, dropClaimedFromParent, parentInbox, childInbox,
     /** The context the last delegation created its child through: `'root'` or `'plugin'`. */
     get createdBy() { return createdBy },
   }
@@ -705,13 +742,30 @@ check('message_subagent reaches a working child and an idle one, by name', async
   assert.equal(fake.delivered.length, before, 'a refused message sends nothing')
 
   // Its own child gets the message, attributed to the parent exactly as the
-  // child's own `ask_parent` is.
+  // child's own `ask_parent` is. The child finished its opening turn, so this is
+  // queued as a turn of its own and keeps the attribution the Client draws a
+  // turn trigger from.
   const own = await tool.execute({ name: 'explorer', message: 'focus on the parser' }, { agent: fake.parent, signal })
   assert.deepEqual(own, { name: 'explorer', status: 'delivered' })
-  const [, message] = fake.created.filter(entry => entry[0] === 'child.steer').at(-1)
-  assert.equal(message.source.kind, 'agent-message')
-  assert.equal(message.source.senderSessionId, fake.parent.id)
-  assert.equal(message.content[1].text, 'focus on the parser')
+  assert.deepEqual(fake.created.filter(entry => entry[0] === 'followup').at(-1), [
+    'followup', 'Agent parent-1 sent a message: ',
+  ])
+  assert.equal(
+    fake.child.inbox.nextTurn.at(-1).content[1].text,
+    'focus on the parser',
+    'the whole message reaches the child, header and body',
+  )
+
+  // A child that is still working takes it at its next step instead. That
+  // delivery is spliced into a turn already running, where only a `user` source is
+  // drawn as a visible row — so it claims `user` and keeps the sender on it.
+  const working = await mountWithChild({ deferredIdle: true })
+  const workingTool = working.parentTools.get('message_subagent')
+  await workingTool.execute({ name: 'explorer', message: 'and the tests' }, { agent: working.parent, signal })
+  const [, steered] = working.created.filter(entry => entry[0] === 'child.steer').at(-1)
+  assert.equal(steered.source.kind, 'user')
+  assert.equal(steered.source.senderSessionId, working.parent.id)
+  assert.equal(steered.content[1].text, 'and the tests')
 
   // A recorded child whose Session closed is a different answer from a name that
   // never existed: the first is recoverable in the session list, the second is not.
@@ -762,8 +816,12 @@ check('an interrupted child still accepts a message, which starts its next turn'
     { agent: fake.parent, signal },
   )
   assert.deepEqual(sent, { name: 'explorer', status: 'delivered' })
-  const steered = fake.created.filter(entry => entry[0] === 'child.steer').at(-1)
-  assert.equal(steered[1].content[1].text, 'do this instead')
+  // The interrupted child is idle, so this is queued as its next turn rather than
+  // spliced into the one the user just stopped.
+  assert.deepEqual(fake.created.filter(entry => entry[0] === 'followup').at(-1), [
+    'followup', 'Agent parent-1 sent a message: ',
+  ])
+  assert.equal(fake.child.inbox.nextTurn.at(-1).content[1].text, 'do this instead')
 })
 
 check('foreground: the child is a top-level session on the template preset and route', async () => {
@@ -922,8 +980,12 @@ check('background: a naturally finished child names itself to a busy parent', as
   }, true)
   await new Promise(resolve => setImmediate(resolve))
   const [, message] = fake.delivered.find(([what]) => what === 'steer')
-  assert.equal(message.source.kind, 'subagent-settled')
+  // A busy parent is mid-turn, so the notice is spliced into the running turn
+  // and claims `user` — the only source kind the Client draws as a visible row
+  // there. Everything the notice says, and the sender it records, is unchanged.
+  assert.equal(message.source.kind, 'user')
   assert.equal(message.source.senderSessionId, fake.child.id)
+  assert.equal(message.source.form, 'notice')
   assert.equal(message.content[0].text, 'subagent "explorer" finished.')
   // The Session id is a factual wire field only; it is never model-visible text.
   assert.equal(message.content.some(block => block.text.includes(fake.child.id)), false)
@@ -948,9 +1010,14 @@ check('background: an idle parent is woken', async () => {
   const fake = await mount({ parentStatus: 'idle' })
   await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
   await new Promise(resolve => setImmediate(resolve))
-  // An idle driver starts a turn with a steered message, so the notice is the
-  // thing that gets it working again.
-  assert.ok(fake.delivered.some(([what]) => what === 'steer'))
+  // An idle driver starts a turn with the notice queued as a turn of its own, so
+  // it is the thing that gets the parent working again. Its own `subagent-settled`
+  // source is kept, because a delivery that opens a turn is drawn as a visible
+  // turn trigger under that source already.
+  const [lane, notice] = fake.delivered.find(([, sent]) => sent.content[0].text === 'subagent "explorer" finished.')
+  assert.equal(lane, 'followup')
+  assert.equal(notice.source.kind, 'subagent-settled')
+  assert.equal(fake.delivered.some(([what]) => what === 'inject'), false)
 })
 
 check('a child is not bound to the calling tool\'s signal', async () => {
@@ -1036,20 +1103,16 @@ check('background: a stopped child is waited through, and its next turn is repor
   // The user's own stop button: the child keeps its session and its transcript.
   fake.child.cancel({ kind: 'user' })
   await tick()
-  assert.equal(
-    fake.delivered.some(([, message]) => message.source?.kind === 'subagent-settled'),
-    false,
-    'the interruption itself is never a settlement',
-  )
+  assert.equal(fake.delivered.length, 0, 'the interruption itself is never a settlement')
 
   // The user redirects the child, and that turn ends naturally.
   fake.resumeChild()
   await until(
-    () => fake.delivered.some(([, message]) => message.source?.kind === 'subagent-settled'),
+    () => fake.delivered.length > 0,
     'the child\'s next natural end is reported',
   )
-  const [, message] = fake.delivered.find(([, sent]) => sent.source?.kind === 'subagent-settled')
-  assert.equal(message.content[0].text, 'subagent "explorer" finished.')
+  const [, message] = fake.delivered.find(([, sent]) => sent.content[0].text === 'subagent "explorer" finished.')
+  assert.equal(message.source.senderSessionId, fake.child.id)
 })
 
 check('background: a child that already reported keeps reporting what it does next', async () => {
@@ -1072,7 +1135,7 @@ check('background: a child that already reported keeps reporting what it does ne
   fake.resumeChild('the tests pass')
   await until(() => fake.delivered.length === 2, 'the second turn reports too')
   const [, second] = fake.delivered[1]
-  assert.equal(second.source.kind, 'subagent-settled')
+  assert.equal(second.source.senderSessionId, fake.child.id)
   assert.equal(second.content[0].text, 'subagent "explorer" finished.')
   // The text that came back is this turn's own, not the first turn's again.
   assert.ok(second.content.some(block => block.text === 'the tests pass'))
@@ -1143,11 +1206,7 @@ check('foreground: the result is the tool result and nothing else', async () => 
   // The parent reads this turn's result here, so a notice for the same turn would
   // be the same answer twice. A LATER turn of the same child is a different
   // result, and it is reported.
-  assert.equal(
-    fake.delivered.some(([, message]) => message.source?.kind === 'subagent-settled'),
-    false,
-    'a foreground result is not also delivered as a notice',
-  )
+  assert.equal(fake.delivered.length, 0, 'a foreground result is not also delivered as a notice')
 })
 
 check('foreground: a child nothing wakes again leaves the call waiting', async () => {
@@ -1246,10 +1305,78 @@ check('a child session can ask its parent a question', async () => {
   )
   assert.deepEqual(value, { delivered: true })
   const [, message] = fake.delivered.find(([what]) => what === 'steer')
-  assert.equal(message.source.kind, 'agent-message')
+  // The parent is mid-turn, so the question is spliced into the running turn and
+  // claims `user` — the only source kind the Client draws as a visible row there.
+  assert.equal(message.source.kind, 'user')
   assert.equal(message.source.senderSessionId, fake.child.id)
   assert.equal(message.content[0].text, 'subagent "x" sent a message: ')
   assert.equal(message.content[1].text, 'which branch did you mean?')
+})
+
+check('an idle parent is asked through a turn of its own, keeping its attribution', async () => {
+  const fake = await mount({ parentStatus: 'idle' })
+  await delegate(fake, { name: 'x', template: 'high', prompt: 'look' }, false)
+  await fake.childTools.get('ask_parent').execute(
+    { question: 'which branch did you mean?' },
+    { agent: fake.child, signal: new AbortController().signal },
+  )
+  const [lane, message] = fake.delivered.find(([, sent]) => sent.content[0].text === 'subagent "x" sent a message: ')
+  // A delivery that opens a turn is already a visible turn trigger under its own
+  // source, so nothing is disguised: the icon still names the asking child.
+  assert.equal(lane, 'followup')
+  assert.equal(message.source.kind, 'agent-message')
+  assert.equal(message.source.senderSessionId, fake.child.id)
+})
+
+check('a failed turn that claimed a notice puts it back', async () => {
+  // The defect this guards: before every step the Harness claims the recipient's
+  // whole inbox batch as a durable deletion, and the batch is logged only once
+  // the request for that step is being prepared. A turn that breaks in between —
+  // a pre-step listener, a route that will not resolve, a full disk — ends with
+  // the message gone from the log and gone from the inbox. Continuing the parent
+  // then runs a turn that never saw it.
+  const fake = await mount({ parentStatus: 'running' })
+  await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  await until(() => fake.delivered.length === 1, 'the first turn reports')
+  const [firstLane, first] = fake.delivered[0]
+
+  fake.dropClaimedFromParent('error')
+  await until(() => fake.delivered.length === 2, 'the lost notice is put back')
+  const [secondLane, second] = fake.delivered[1]
+  assert.equal(second.id, first.id, 'it is the same message, under its own identity')
+  assert.deepEqual(second.content, first.content)
+  assert.equal(second.source.senderSessionId, first.source.senderSessionId)
+  // The parent is idle again, so the replacement opens its own turn — the one
+  // route that is a visible turn trigger again rather than a splice.
+  assert.equal(firstLane, 'steer')
+  assert.equal(secondLane, 'followup')
+  assert.ok(fake.warnings.some(text => text.includes('dropped by a failed turn')))
+})
+
+check('a turn that never claimed a notice leaves it queued', async () => {
+  // Only a CLAIMED message is lost. One the failed turn never reached is still in
+  // the inbox, so putting it back would deliver it twice.
+  const fake = await mount({ parentStatus: 'running' })
+  await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  await until(() => fake.delivered.length === 1, 'the first turn reports')
+  fake.listeners.get('session/event')?.(fake.parent.session, {
+    type: 'turn/end', data: { reason: { kind: 'error' } },
+  })
+  await tick()
+  assert.equal(fake.delivered.length, 1, 'a queued notice is delivered exactly once')
+  assert.equal(fake.parentInbox.nextStep.length, 1)
+})
+
+check('a stopped turn does not put a notice back', async () => {
+  // A cancellation is somebody deciding this work should not continue. Putting the
+  // message back into it would override that decision rather than repair a failure.
+  const fake = await mount({ parentStatus: 'running' })
+  await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  await until(() => fake.delivered.length === 1, 'the first turn reports')
+  fake.dropClaimedFromParent('aborted')
+  await tick()
+  assert.equal(fake.delivered.length, 1, 'an interrupted turn is not repaired')
+  assert.equal(fake.warnings.some(text => text.includes('dropped by a failed turn')), false)
 })
 
 check('a child session is told its own name, its parent, and that it may ask', async () => {

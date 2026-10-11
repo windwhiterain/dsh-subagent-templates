@@ -43,6 +43,13 @@
  * whose inherited-context child would be a second kind of object with a second
  * lifecycle.
  *
+ * Every message this plugin hands to another Session goes through one channel
+ * (`./lib/delivery.js`), which picks the route the recipient's own state requires:
+ * a delivery that opens a turn keeps the attribution the Client draws a turn
+ * trigger from, a delivery spliced into a turn already running claims the one
+ * source kind that is a visible row there, and a message a failed turn claimed
+ * and never logged is put back once that turn is over.
+ *
  * Delegation is capped the way the Harness caps its own subagents:
  * `maxActiveSubagents` bounds how many children a session has working at once,
  * and `maxDepth` bounds how deep delegation nests. Both read this plugin's
@@ -60,6 +67,7 @@
  */
 
 import { Config, normalizeConfig } from './lib/config.js'
+import { createDeliveryChannel } from './lib/delivery.js'
 import {
   createDelegationTool,
   createDeleteSubagentTool,
@@ -105,6 +113,12 @@ export async function apply(ctx, rawConfig) {
   const claimedNames = new Map()
 
   const store = await openMappingStore(ctx)
+
+  // Every message this plugin hands to another Agent travels here: the channel
+  // picks the route the recipient's own state requires, keeps the message
+  // visible in the Client while it joins a running turn, and puts back one a
+  // failed turn claimed and never logged. See ./lib/delivery.js.
+  const deliveries = createDeliveryChannel(ctx)
 
   /**
    * Reserve one name among a parent's subagents.
@@ -215,7 +229,7 @@ export async function apply(ctx, rawConfig) {
   // They are never withdrawn again. A session that has delegated may delegate
   // again at any point, and keeping them means it does not have to earn them a
   // second time; after its last child is gone they answer honestly instead.
-  const control = { store, agents: ctx.get('agents') }
+  const control = { store, agents: ctx.get('agents'), deliveries }
   const childToolScopes = new Map()
 
   /**
@@ -298,6 +312,7 @@ export async function apply(ctx, rawConfig) {
         claimName,
         onDelegated: adoptChildTools,
         registerChild,
+        deliveries,
         maxDepth: current.maxDepth,
         maxActiveSubagents: current.maxActiveSubagents,
       })),
@@ -362,6 +377,10 @@ export async function apply(ctx, rawConfig) {
   ctx.effect(() => async () => {
     for (const holder of childToolScopes.values()) holder.dispose()
     childToolScopes.clear()
+    // Live children deliberately survive this unload, so the channel stops
+    // watching them first: a replaced instance re-arms it on its own
+    // deliveries, and a child this instance never reaches again owes nothing.
+    deliveries.stop()
     await store?.close()
   })
 }
