@@ -83,6 +83,7 @@ import {
 } from './lib/tool.js'
 import { openMappingStore } from './lib/store.js'
 import { childrenProjection } from './lib/projection.js'
+import { installParentChannel, turnsEnded, watchChildSettlement } from './lib/session-delegate.js'
 
 export const name = 'subagent-templates'
 export const inject = ['tools']
@@ -180,10 +181,16 @@ export async function apply(ctx, rawConfig) {
    * that ends a delegated child: an interruption leaves the child live and its
    * watch armed (its next natural turn is what reports), but a deleted child can
    * never settle, and a watch that outlived it could only wait forever.
+   *
+   * A child this instance did not create has no entry in `running` — that is
+   * what a restart leaves behind — so its watch is ended here too, by the id
+   * rather than by the record this instance happens to hold.
    * @param sessionId - the child session id.
    * @param reason - why it is being stopped.
    */
   const stopChild = (sessionId, reason) => {
+    childWatches.get(sessionId)?.stop()
+    childWatches.delete(sessionId)
     const child = running.get(sessionId)
     if (child === undefined) return
     running.delete(sessionId)
@@ -238,6 +245,75 @@ export async function apply(ctx, rawConfig) {
   const childToolScopes = new Map()
 
   /**
+   * The settlement watch each recorded child currently has, keyed by that
+   * child's Session id.
+   *
+   * One child gets one watch per instance, whoever created it: the delegating
+   * call that spawned it, or the re-adoption that found it later. Two watches on
+   * one child would each report the same turn.
+   */
+  const childWatches = new Map()
+
+  /**
+   * Holds one child's watch as this instance's answer for it.
+   *
+   * The returned releaser is what an explicit end, a child Session going away,
+   * and this instance's own teardown all go through, so no watch outlives the
+   * state that justifies it.
+   * @param childSessionId - the child's Session id.
+   * @param watch - the watch to hold.
+   * @returns the releaser for this watch alone.
+   */
+  const trackWatch = (childSessionId, watch) => {
+    childWatches.set(childSessionId, watch)
+    return () => {
+      if (childWatches.get(childSessionId) === watch) childWatches.delete(childSessionId)
+    }
+  }
+
+  /**
+   * Sessions a settlement notice is waiting for, keyed by that Session id.
+   *
+   * A child can finish a turn while its parent's Session is not resumed — one
+   * the user closed, or one a restarted host has not brought back yet. The
+   * result is held rather than dropped, and this is what it waits on: the one
+   * `agent/created` listener below answers every wait, so no watch needs an
+   * event subscription of its own.
+   */
+  const parentWaiters = new Map()
+
+  /**
+   * Resolve the live parent Agent a notice must reach.
+   * @param parentSessionId - the delegating parent Session.
+   * @param signal - ends the wait when the watch that owns it is stopped.
+   * @returns the parent Agent, or undefined once the wait was stopped.
+   */
+  const waitForParent = (parentSessionId, signal) => {
+    const live = control.agents?.get(parentSessionId)
+    if (live !== undefined) return Promise.resolve(live)
+    return new Promise((resolve) => {
+      const waiters = parentWaiters.get(parentSessionId) ?? new Set()
+      let finished = false
+      const finish = (parent) => {
+        if (finished) return
+        finished = true
+        waiters.delete(finish)
+        if (waiters.size === 0) parentWaiters.delete(parentSessionId)
+        signal.removeEventListener('abort', onStop)
+        resolve(parent)
+      }
+      const onStop = () => finish(undefined)
+      waiters.add(finish)
+      parentWaiters.set(parentSessionId, waiters)
+      signal.addEventListener('abort', onStop, { once: true })
+      // A parent that came back between the read above and this registration must
+      // not be missed; it reports itself here rather than at the next event.
+      const now = control.agents?.get(parentSessionId)
+      if (now !== undefined) finish(now)
+    })
+  }
+
+  /**
    * Install the child-management tools into one session's own scope, at most once.
    *
    * `ctx.inject` runs its callback only after the fiber's first await, so the
@@ -281,13 +357,85 @@ export async function apply(ctx, rawConfig) {
     })
   }
 
-  // A hot reload replaces this instance and loses every scope it adopted, while
-  // the children it recorded are still in the store. Adopting the live sessions
-  // that already have children is what keeps a reloaded session's tools from
-  // vanishing until it happens to delegate again.
-  for (const agent of ctx.get('agents')?.list() ?? []) {
-    if ((store?.childrenOf(agent.id) ?? []).length > 0) adoptChildTools(agent)
+  /**
+   * Teach one recorded child what it is again, and give it back its watch.
+   *
+   * A child this instance did not create — one whose Session the host resumed
+   * after a restart, or one that outlived a reloaded instance — has lost both:
+   * the `ask_parent` that was registered in its own creation scope, and the
+   * watch that carried its results home. The mapping record is what still says
+   * which parent it belongs to and what it is called, which is everything either
+   * one needs.
+   *
+   * The watch resumes from what the record says the parent has already been
+   * told, and a record that says nothing is read as "everything the child's log
+   * holds", so a delegation made before this counter existed is never replayed.
+   * @param entry - the child's recorded mapping with its Session id.
+   */
+  const adoptRecordedChild = (entry) => {
+    const { childSessionId, mapping } = entry
+    const child = control.agents?.get(childSessionId)
+    if (child === undefined) return
+    installParentChannel(ctx, child.ctx, mapping.parentSessionId, mapping.name, deliveries)
+    if (childWatches.has(childSessionId)) return
+    const watch = watchChildSettlement(ctx, {
+      name: mapping.name,
+      sessionId: childSessionId,
+      child,
+      parentSessionId: mapping.parentSessionId,
+      deliveries,
+      waitForParent,
+      answered: mapping.reportedTurns ?? turnsEnded(child.session.snapshotEvents()),
+      markDelivered: (turns) => store?.markReported(childSessionId, turns),
+    })
+    trackWatch(childSessionId, watch)
+    watch.report()
   }
+
+  /**
+   * Make one live session whole again, in whichever role it plays.
+   *
+   * A session that has delegated gets the tools that act on its children; a
+   * session that WAS delegated gets its own channel up and a watch over its
+   * turns. Both are read from the mapping store, which is durable, and both are
+   * needed again for every Agent the host creates — so this runs on each one
+   * rather than once when the plugin loads. A restart is exactly the case where
+   * loading finds nothing: no Session is resumed until the user opens it.
+   * @param agent - the live Agent that just appeared.
+   */
+  const reconcile = (agent) => {
+    if (store?.hasChildren(agent.id) === true) adoptChildTools(agent)
+    for (const entry of store?.childrenOf(agent.id) ?? []) adoptRecordedChild(entry)
+    const mapping = store?.get(agent.id)
+    if (mapping !== undefined) adoptRecordedChild({ childSessionId: agent.id, mapping })
+  }
+
+  // A session this plugin never delegated in: whatever is already live when the
+  // row activates, which is what a reload finds. A cold start finds nothing here
+  // and everything through `agent/created` below.
+  for (const agent of control.agents?.list() ?? []) reconcile(agent)
+
+  // Every Session the host brings up afterwards, in either role. This is the
+  // Harness's own pattern for the same problem: a Session resumes long after the
+  // plugin that composed it loaded, and what it needs has to follow it there.
+  ctx.on('agent/created', ({ agent }) => {
+    reconcile(agent)
+    const waiters = parentWaiters.get(agent.id)
+    if (waiters === undefined) return
+    parentWaiters.delete(agent.id)
+    for (const finish of waiters) finish(agent)
+  })
+  ctx.on('agent/disposed', ({ agent }) => {
+    // The scope this session's tools lived in is unwinding with it, so the entry
+    // has to go with it: a Session resumed later arrives under the same id, and
+    // a stale entry would tell it it had already been adopted.
+    childToolScopes.delete(agent.id)
+    // A watch on this child was observing an Agent that no longer exists, so it
+    // can never see another turn. Its parent's watch is left alone: a parent
+    // Session going away is not a reason to forget what its child owes it.
+    childWatches.get(agent.id)?.stop()
+    childWatches.delete(agent.id)
+  })
 
   /**
    * Template id -> display name, for the sidebar projection. Rebuilt with the
@@ -316,6 +464,8 @@ export async function apply(ctx, rawConfig) {
         store,
         claimName,
         onDelegated: adoptChildTools,
+        trackWatch,
+        waitForParent,
         registerChild,
         deliveries,
         maxDepth: current.maxDepth,
@@ -375,13 +525,21 @@ export async function apply(ctx, rawConfig) {
   // A disposed parent no longer ends its children. Each child is its own
   // Session, so it keeps working and the user can still open, steer, or delete
   // it; only an explicit delete stops one.
-  // Unloading releases the storage unit and withdraws every adopted scope —
-  // the adopted registrations live on the agents' fibers, not this plugin's, so
-  // nothing else would take them back — but it deliberately leaves live children
-  // running: a code reload must never destroy a subagent mid-task.
+  // Unloading releases the storage unit, withdraws every adopted scope, and ends
+  // every watch this instance armed — the adopted registrations live on the
+  // agents' fibers, not this plugin's, so nothing else would take them back. The
+  // children themselves deliberately keep running: a code reload must never
+  // destroy a subagent mid-task.
   ctx.effect(() => async () => {
     for (const holder of childToolScopes.values()) holder.dispose()
     childToolScopes.clear()
+    // A watch left armed would report through a closed mapping domain and, once
+    // its replacement armed one beside it, twice. What it owed is not lost: the
+    // delivered count is durable, so the next instance resumes from where this
+    // one stopped rather than replaying what the parent already has.
+    for (const watch of childWatches.values()) watch.stop()
+    childWatches.clear()
+    parentWaiters.clear()
     // Live children deliberately survive this unload, so the channel stops
     // watching them first: a replaced instance re-arms it on its own
     // deliveries, and a child this instance never reaches again owes nothing.

@@ -92,6 +92,8 @@ function toolApi(agent) {
  * @param options.whenIdle - the child's idle await ('never' to hang).
  * @param options.deferredIdle - the child's turn stays open until it is stopped.
  * @param options.liveAgents - Agents already in the host's registry, as a reload sees them.
+ * @param options.coldStart - nothing is resumed yet, as a restarted host sees it.
+ * @param options.resumeChild - the child's identity and durable log, as a restart finds them.
  * @param options.shared - an earlier instance's `storeRecords`, as a reload reopens them.
  * @param options.cancelThrows - the child refuses cancellation.
  * @param options.cwd - the parent's working directory.
@@ -121,9 +123,13 @@ function harness(options = {}) {
 
   // The child's own log. A child runs turn after turn, and the log is the state
   // that decides an outcome: what a settlement watch counts is how many turns
-  // have ended here, so a second turn has to be visible in it.
-  const turnLog = [{ type: 'user/message', data: {} }]
-  let turnCount = 0
+  // have ended here, so a second turn has to be visible in it. A resumed child
+  // brings the log its Session already had — that log is the half of "has this
+  // turn already been reported" the mapping record cannot answer.
+  const turnLog = options.resumeChild === undefined
+    ? [{ type: 'user/message', data: {} }]
+    : [...options.resumeChild.log]
+  let turnCount = turnLog.filter(event => event.type === 'turn/start').length
   /** The events one turn appends, closing with the text it answered. */
   const turnEvents = (answer) => {
     turnCount += 1
@@ -143,6 +149,44 @@ function harness(options = {}) {
   // interrupted, and its settlement would have been delivered before the stop.
   let releaseIdle = () => {}
   const idlePromise = new Promise((resolve) => { releaseIdle = () => resolve() })
+
+  /**
+   * The contract a real Agent keeps: `whenIdle()` resolves once it has finished
+   * reacting to a turn, and NOT while it is still working.
+   *
+   * A settlement watch depends on that — it waits here for the child's next turn
+   * to end — so a fake that resolved this immediately would spin it, and one
+   * that never resolved it would strand a re-armed watch whose child Session was
+   * resumed with its turn already over.
+   * @type {Array<{agent: object, resolve: () => void}>}
+   */
+  const idleWaiters = []
+
+  /**
+   * Move one Agent to a new status, releasing whatever was waiting for it to
+   * stop working.
+   * @param agent - the Agent whose status changed.
+   * @param status - the status it now reports.
+   */
+  const setStatus = (agent, status) => {
+    agent.status = status
+    if (status === 'running') return
+    for (let index = idleWaiters.length - 1; index >= 0; index -= 1) {
+      if (idleWaiters[index].agent !== agent) continue
+      idleWaiters[index].resolve()
+      idleWaiters.splice(index, 1)
+    }
+  }
+
+  /**
+   * The Agent's own answer to "have you finished reacting".
+   * @param agent - the Agent being waited on.
+   * @returns resolution once that Agent is no longer working.
+   */
+  const whenIdleOf = (agent) => {
+    if (agent.status !== 'running') return Promise.resolve()
+    return new Promise((resolve) => idleWaiters.push({ agent, resolve }))
+  }
 
   const presetsApi = {
     mount: async (_agentCtx, presetId) => {
@@ -179,7 +223,8 @@ function harness(options = {}) {
   const parentInbox = { nextTurn: [], nextStep: [] }
 
   const child = {
-    id: '',
+    // A resumed child arrives under the identity its Session already had.
+    id: options.resumeChild?.id ?? '',
     options: {},
     inbox: childInbox,
     steer: (message) => {
@@ -187,8 +232,8 @@ function harness(options = {}) {
       created.push(['child.steer', message])
     },
     session: {
-      id: '',
-      header: { id: '' },
+      id: options.resumeChild?.id ?? '',
+      header: { id: options.resumeChild?.id ?? '' },
       requestHeader: () => undefined,
       // A cancelled turn ends `aborted`, which is what makes a stopped child an
       // external stop rather than a finished one.
@@ -222,17 +267,17 @@ function harness(options = {}) {
       // over — answered, and idle, which is what leaves a watch waiting for the
       // next turn rather than reporting the same one again.
       turnLog.push(...turnEvents(options.answer ?? 'done'))
-      if (options.deferredIdle !== true) child.status = 'idle'
+      if (options.deferredIdle !== true) setStatus(child, 'idle')
     },
     whenIdle: options.whenIdle === 'never'
       ? () => new Promise(() => {})
-      : options.deferredIdle === true ? () => idlePromise : async () => {},
+      : options.deferredIdle === true ? () => idlePromise : () => whenIdleOf(child),
     cancel: (cause) => {
       created.push(['cancel', cause.kind])
       cancelled = cause.kind
       // A cancelled turn leaves the running phase, so the Agent is live and idle:
       // this is the state `interrupt_subagent` exists to leave behind.
-      child.status = 'idle'
+      setStatus(child, 'idle')
       if (options.deferredIdle === true) releaseIdle()
       if (options.cancelThrows === true) throw new Error('session is closing')
     },
@@ -245,10 +290,14 @@ function harness(options = {}) {
   const parent = {
     id: 'parent-1',
     options: { provider: 'p', model: 'm' },
-    session: { header: { id: 'parent-1', cwd: options.cwd ?? 'C:/work' } },
+    // A Session that has delegated nothing has an empty log; the plugin reads it
+    // only to learn how many turns have ended, and every live Agent has one.
+    session: { header: { id: 'parent-1', cwd: options.cwd ?? 'C:/work' }, snapshotEvents: () => [] },
     status: options.parentStatus ?? 'running',
     inbox: parentInbox,
-    whenIdle: async () => {},
+    // The same contract the child follows: a session that is still working has
+    // not finished reacting to anything.
+    whenIdle: () => whenIdleOf(parent),
     followup: (message) => {
       parentInbox.nextTurn.push(message)
       delivered.push(['followup', message])
@@ -270,6 +319,9 @@ function harness(options = {}) {
     const scopedToolApi = toolApi(agent)
     return {
       get: (key) => (key === 'tools' ? scopedToolApi : undefined),
+      // Every live Agent has a context that emits its own events, which is what a
+      // watch listens to for the moment the Agent starts working again.
+      on: (event, listener) => { listeners.set(`${agent.id}:${event}`, listener); return () => {} },
       // Cordis activates an injected callback only after the fiber's first await,
       // and contains a callback that throws by logging it. Both matter here: the
       // plugin captures a disposer across this call, and a registration this scope
@@ -294,13 +346,37 @@ function harness(options = {}) {
   // seeds it, which is how a hot reload is modelled: the Agents belong to the
   // host, not to the plugin, so they survive the plugin being replaced — and so
   // does their tool scope, which this fake reaches through the Agent itself.
-  const live = new Map([[parent.id, parent]])
+  // `coldStart` seeds nothing at all, which is how a RESTART is modelled: the
+  // host resumes no Session until the user opens one, so a plugin that only
+  // looked at what was live when it loaded finds nothing.
+  const live = new Map()
+  if (options.coldStart !== true) live.set(parent.id, parent)
   for (const agent of options.liveAgents ?? []) {
     agent.ctx = agentScope(agent)
+    // Every live Agent has a Session; one this probe did not give a log to has
+    // an empty one, which is what "delegated nothing yet" looks like to a watch.
+    agent.session ??= { id: agent.id, header: { id: agent.id }, snapshotEvents: () => [] }
     live.set(agent.id, agent)
   }
   const registry = { get: id => live.get(id) }
   const agents = registry
+
+  /**
+   * Bring one Session back, exactly as the host does when the user opens it.
+   *
+   * The Agent that comes back is a NEW Agent under a Session id the host already
+   * knows — which is the whole point of a restart: nothing survives in memory,
+   * so whatever the plugin needs for that Session has to be rebuilt from the
+   * durable store when this fires.
+   * @param agent - the Agent the host resumed for that Session.
+   * @returns that same Agent, for chaining.
+   */
+  const resumeSession = (agent) => {
+    if (agent.ctx === undefined) agent.ctx = agentScope(agent)
+    live.set(agent.id, agent)
+    listeners.get('agent/created')?.({ agent, source: 'resume' })
+    return agent
+  }
   // The application root context, as Cordis hands it to every plugin. Where a call
   // reaches `agents` from decides who owns what it creates, so this fake keeps the plugin
   // context and the root context apart rather than answering both with one registry.
@@ -461,6 +537,9 @@ function harness(options = {}) {
         requestResolvers.push(resolved)
       }
       await createOptions.setup?.(child.ctx, child)
+      // The host announces the new Agent once its creation window has closed,
+      // which is when a plugin re-adopting live Sessions hears about it.
+      listeners.get('agent/created')?.({ agent: child, source: 'startup' })
       // The real Agent is fused to its creation signal: aborting that signal is
       // what tears the child down. Model that so an ownership bug shows here.
       createOptions.signal?.addEventListener('abort', () => {
@@ -486,6 +565,19 @@ function harness(options = {}) {
   root.get = (key) => (key === 'agents' ? agentsFor('root') : undefined)
 
   /**
+   * Report that one Agent started working again, on whichever context is now
+   * its own. A watch listens on the Agent's context, and a Session resumed under
+   * a fresh Agent is reached through that new context rather than the one its
+   * creation installed.
+   * @param agent - the Agent that started working.
+   */
+  const fireAgentStatus = (agent) => {
+    const event = { agent, status: 'running' }
+    listeners.get('child:agent/status')?.(event)
+    listeners.get(`${agent.id}:agent/status`)?.(event)
+  }
+
+  /**
    * Model the child starting another turn and ending it naturally.
    *
    * The state that decides an outcome is the log, not a flag: appending this
@@ -497,10 +589,10 @@ function harness(options = {}) {
    */
   const resumeChild = (answer = options.answer ?? 'done') => {
     cancelled = null
-    child.status = 'running'
-    listeners.get('child:agent/status')?.({ agent: child, status: 'running' })
+    setStatus(child, 'running')
+    fireAgentStatus(child)
     turnLog.push(...turnEvents(answer))
-    child.status = 'idle'
+    setStatus(child, 'idle')
   }
 
   /**
@@ -514,7 +606,7 @@ function harness(options = {}) {
     parentInbox.nextStep.length = 0
     // The turn is over, so the parent is idle again — the state the channel
     // waits for before it decides what to do with what it is holding.
-    parent.status = 'idle'
+    setStatus(parent, 'idle')
     listeners.get('session/event')?.(parent.session, {
       type: 'turn/end',
       data: { reason: { kind } },
@@ -524,7 +616,7 @@ function harness(options = {}) {
   return {
     ctx, parent, child, agentsApi, tools, parentTools, childTools, listeners, disposers, created, attached,
     delivered, warnings, errors, settingsPresentations, store, storeRecords, requestResolvers, archived, renamed, projections, execSignal: undefined,
-    facility, root, resumeChild, dropClaimedFromParent, parentInbox, childInbox,
+    facility, root, resumeChild, resumeSession, dropClaimedFromParent, parentInbox, childInbox,
     /** The context the last delegation created its child through: `'root'` or `'plugin'`. */
     get createdBy() { return createdBy },
   }
@@ -592,6 +684,21 @@ async function until(condition, message) {
     await tick()
   }
   assert.ok(condition(), message)
+}
+
+/**
+ * One child's durable log, as a restart reads it back.
+ *
+ * The log outlives the process — it is what makes "has this turn already been
+ * reported" answerable at all — so a restart hands the new instance the events
+ * the old child's Session had.
+ * @param fake - the fake whose child to read.
+ * @returns that child's own session events.
+ */
+function childLog(fake) {
+  return fake.child.session.snapshotEvents().map(event => (
+    event.type === 'turn/end' ? { type: 'turn/end', data: { reason: { kind: 'completed' } } } : event
+  ))
 }
 
 check('config: rejects unknown fields, bad ids, duplicates, and empty lists', () => {
@@ -693,6 +800,232 @@ check('a reloaded instance adopts the live sessions that already have children',
   assert.deepEqual(second.errors, [], 'the replacement registered instead of colliding with the stale tools')
 })
 
+check('a restarted host finds the sessions again, and the tools come back with them', async () => {
+  // The defect this guards: adoption only ran once, over the Agents that were
+  // live when the row loaded. A restarted host has none — it resumes no Session
+  // until the user opens one — so a session that had delegated came back with no
+  // way to manage what it delegated, and would only get them by delegating again.
+  const first = await mountWithChild()
+  const records = first.storeRecords
+
+  // The restart: a new process, the same durable store, and no Session resumed.
+  const second = harness({ coldStart: true, shared: { storeRecords: records } })
+  await apply(second.ctx, { templates: TEMPLATES })
+  // The scope that carried the old tools died with the old Agent; the Session
+  // comes back as a different Agent with an empty scope of its own.
+  assert.deepEqual([...second.parentTools.keys()], [], 'nothing is live yet, so nothing is adopted')
+
+  // The user opens the session that had delegated. That is the whole event the
+  // adoption has to answer.
+  second.resumeSession(second.parent)
+  await until(() => second.parentTools.size === 4, 'the resumed session gets its tools back')
+  assert.deepEqual([...second.parentTools.keys()].sort(), [
+    'delete_subagent', 'interrupt_subagent', 'list_subagents', 'message_subagent',
+  ])
+  assert.deepEqual(second.errors, [], 'without colliding with anything the dead scope left')
+})
+
+check('a restarted host reports what the child finished while it was down', async () => {
+  const first = await mountWithChild({ parentStatus: 'running' })
+  await until(() => first.delivered.length === 1, 'the opening turn reports')
+  const childId = first.child.id
+  assert.equal(first.storeRecords.get(childId).reportedTurns, 1, 'the delivered count is durable')
+
+  // The restart. The child Session comes back too, with the log it had.
+  const second = harness({
+    coldStart: true,
+    shared: { storeRecords: first.storeRecords },
+    resumeChild: { id: childId, log: childLog(first) },
+  })
+  await apply(second.ctx, { templates: TEMPLATES })
+  second.resumeSession(second.parent)
+  second.resumeSession(second.child)
+  // Nothing is owed: the turn in that log was already reported, and a notice
+  // that repeats it is worse than no notice at all.
+  await tick()
+  await tick()
+  assert.equal(second.delivered.length, 0, 'a turn the parent already has is not reported again')
+
+  // What the child does after the restart reaches the parent.
+  second.resumeChild('and after the restart')
+  await until(() => second.delivered.length === 1, 'the next turn reports')
+  const [, message] = second.delivered[0]
+  assert.equal(message.content[0].text, 'subagent "explorer" finished.')
+  assert.ok(message.content.some(block => block.text === 'and after the restart'))
+  assert.equal(second.storeRecords.get(childId).reportedTurns, 2, 'and the count moved with it')
+})
+
+check('a turn that ended while the parent was closed is delivered when it comes back', async () => {
+  const first = await mountWithChild({ parentStatus: 'running' })
+  await until(() => first.delivered.length === 1, 'the opening turn reports')
+  const childId = first.child.id
+
+  // The user closes the delegating session and works in the child's own one.
+  const second = harness({
+    coldStart: true,
+    shared: { storeRecords: first.storeRecords },
+    resumeChild: { id: childId, log: childLog(first) },
+  })
+  await apply(second.ctx, { templates: TEMPLATES })
+  second.resumeSession(second.child)
+  await tick()
+  assert.equal(second.delivered.length, 0, 'a parent that is not resumed has nothing to deliver to')
+
+  // The child finishes a turn nobody was there to receive.
+  second.resumeChild('an answer nobody was listening for')
+  await tick()
+  assert.equal(second.delivered.length, 0, 'and the watch waits rather than dropping it')
+  assert.equal(second.storeRecords.get(childId).reportedTurns, 1, 'the count has not moved yet')
+
+  // The user opens the delegating session again.
+  second.resumeSession(second.parent)
+  await until(() => second.delivered.length === 1, 'the held answer is delivered')
+  const [, message] = second.delivered[0]
+  assert.ok(message.content.some(block => block.text === 'an answer nobody was listening for'))
+  assert.equal(second.storeRecords.get(childId).reportedTurns, 2)
+})
+
+check('a record with no delivered count is read as everything the child has done', async () => {
+  // A record written before this counter existed carries nothing, and zero would
+  // mean "report all of it again" — so the child's own log is what settles it.
+  const childId = 'subagent-template-legacy'
+  const fake = harness({
+    coldStart: true,
+    shared: { storeRecords: new Map([[childId, {
+      parentSessionId: 'parent-1',
+      name: 'legacy',
+      templateId: 'medium',
+      createdAt: 1,
+      cwd: 'C:/work',
+    }]]) },
+    resumeChild: { id: childId, log: [
+      { type: 'user/message', data: {} },
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'old work' }] }, stream: [] } },
+      { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+    ] },
+  })
+  await apply(fake.ctx, { templates: TEMPLATES })
+  fake.resumeSession(fake.parent)
+  fake.resumeSession(fake.child)
+  await tick()
+  await tick()
+  assert.equal(fake.delivered.length, 0, 'an old record is never replayed')
+
+  fake.resumeChild('new work')
+  await until(() => fake.delivered.length === 1, 'and the next turn still reports')
+  assert.ok(fake.delivered[0][1].content.some(block => block.text === 'new work'))
+})
+
+check('a resumed child can ask its parent again', async () => {
+  const first = await mountWithChild()
+  const childId = first.child.id
+  const second = harness({
+    coldStart: true,
+    shared: { storeRecords: first.storeRecords },
+    resumeChild: { id: childId, log: childLog(first) },
+  })
+  await apply(second.ctx, { templates: TEMPLATES })
+  second.resumeSession(second.parent)
+  second.resumeSession(second.child)
+
+  // The tool lived in the child's own creation scope, which the restart took with
+  // it, and the record is all that still says this child has a parent.
+  await until(() => second.childTools.has('ask_parent'), 'ask_parent is restored')
+  const askParent = second.childTools.get('ask_parent')
+  assert.equal(typeof askParent.execute, 'function')
+  await askParent.execute({ question: 'still the parser?' }, { agent: second.child, signal: new AbortController().signal })
+  const [, message] = second.delivered.find(([, sent]) => sent.content[0].text.startsWith('subagent "explorer" sent a message'))
+  assert.equal(message.content[1].text, 'still the parser?')
+
+  // And restoring it twice is not a second tool: a scope refuses one name twice.
+  second.resumeSession(second.child)
+  assert.equal(second.childTools.size, 1)
+  assert.deepEqual(second.errors, [], 'a refused re-registration is the already-taught answer')
+})
+
+check('one watch per child, whoever created it', async () => {
+  // The delegating call arms the watch for a child it just created, and the
+  // re-adoption that finds the same child later must not arm a second: two
+  // watches would report one turn twice.
+  const first = await mountWithChild({ parentStatus: 'running' })
+  await until(() => first.delivered.length === 1, 'the opening turn reports')
+  const childId = first.child.id
+
+  const second = harness({
+    coldStart: true,
+    shared: { storeRecords: first.storeRecords },
+    resumeChild: { id: childId, log: childLog(first) },
+  })
+  await apply(second.ctx, { templates: TEMPLATES })
+  // The parent first, which arms over every child it has recorded...
+  second.resumeSession(second.parent)
+  // ...and then the child itself, which reconciles as a child of that parent.
+  second.resumeSession(second.child)
+  second.resumeChild('one turn, one notice')
+  await until(() => second.delivered.length === 1, 'the turn reports')
+  await tick()
+  await tick()
+  assert.equal(second.delivered.length, 1, 'the turn is reported exactly once')
+})
+
+check('a reloaded instance hands the count over instead of replaying it', async () => {
+  // A reload is the same handoff as a restart, minus the process: the old
+  // instance's watches are stopped by its teardown, and the new one resumes from
+  // what the record says the parent already has.
+  const first = await mountWithChild({ parentStatus: 'running' })
+  await until(() => first.delivered.length === 1, 'the opening turn reports')
+  const childId = first.child.id
+  for (const entry of first.disposers) await entry.dispose?.()
+
+  const second = harness({
+    // A reload leaves the Agents alone — that is the whole difference from a
+    // restart — so the delegating session arrives here as the same Agent, with
+    // the scope its tools are registered into and the inbox its notices land in.
+    liveAgents: [first.parent],
+    shared: { storeRecords: first.storeRecords, facility: first.facility },
+    resumeChild: { id: childId, log: childLog(first) },
+  })
+  await apply(second.ctx, { templates: TEMPLATES })
+  second.resumeSession(second.child)
+  await until(() => first.parentTools.size === 4, 'the replacement adopted the session')
+  await tick()
+  await tick()
+  assert.equal(first.delivered.length, 1, 'the turn the parent already has is not sent again')
+
+  second.resumeChild('after the reload')
+  await until(() => first.delivered.length === 2, 'and the next turn reports')
+  assert.ok(first.delivered[1][1].content.some(block => block.text === 'after the reload'))
+})
+
+check('a deleted child stops reporting even when this instance never created it', async () => {
+  const first = await mountWithChild({ parentStatus: 'running' })
+  await until(() => first.delivered.length === 1, 'the opening turn reports')
+  const childId = first.child.id
+
+  const second = harness({
+    coldStart: true,
+    shared: { storeRecords: first.storeRecords },
+    resumeChild: { id: childId, log: childLog(first) },
+  })
+  await apply(second.ctx, { templates: TEMPLATES })
+  second.resumeSession(second.parent)
+  second.resumeSession(second.child)
+  await until(() => second.parentTools.size === 4, 'the resumed session has its tools')
+
+  // The handle that created the child died with the previous instance, so this
+  // deletion goes through the archive-with-stop path — but the watch this
+  // instance armed is the one thing it must still end.
+  await second.parentTools.get('delete_subagent').execute(
+    { names: ['explorer'] },
+    { agent: second.parent, signal: new AbortController().signal },
+  )
+  second.resumeChild('too late')
+  await tick()
+  await tick()
+  assert.equal(second.delivered.length, 0, 'a deleted child reports nothing')
+})
+
 check('list_subagents reports each child by name, template, and work', async () => {
   const fake = await mountWithChild()
   const tool = fake.parentTools.get('list_subagents')
@@ -761,6 +1094,9 @@ check('message_subagent reaches a working child and an idle one, by name', async
   const fake = await mountWithChild()
   const tool = fake.parentTools.get('message_subagent')
   const signal = new AbortController().signal
+  // The child's opening turn settles asynchronously, so wait for the notice the
+  // delegation owes before counting what this check's own calls deliver.
+  await until(() => fake.delivered.length === 1, 'the opening turn reports')
   const before = fake.delivered.length
 
   // A name this parent never gave is refused without touching anything.
@@ -1569,15 +1905,17 @@ check('maxDepth: admits a delegation at the cap', async () => {
 })
 
 check('maxDepth: counts the chain the mapping store recorded', async () => {
-  const fake = await mount({ config: { templates: TEMPLATES, maxDepth: 1 } })
-  // The delegating Session is itself a recorded child, so its own child is depth 2.
-  fake.storeRecords.set('parent-1', {
-    parentSessionId: 'grandparent-1',
-    name: 'mid',
-    templateId: 'medium',
-    createdAt: 1,
-    cwd: 'C:/work',
+  const fake = await mount({
+    config: { templates: TEMPLATES, maxDepth: 1 },
+    shared: { storeRecords: new Map([['parent-1', {
+      parentSessionId: 'grandparent-1',
+      name: 'mid',
+      templateId: 'medium',
+      createdAt: 1,
+      cwd: 'C:/work',
+    }]]) },
   })
+  // The delegating Session is itself a recorded child, so its own child is depth 2.
   await assert.rejects(
     () => delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false),
     /exceeds maxDepth 1/,
@@ -1585,13 +1923,15 @@ check('maxDepth: counts the chain the mapping store recorded', async () => {
 })
 
 check('maxDepth: provider-managed leaves the depth unbounded', async () => {
-  const fake = await mount({ config: { templates: TEMPLATES, maxDepth: 'provider-managed' } })
-  fake.storeRecords.set('parent-1', {
-    parentSessionId: 'grandparent-1',
-    name: 'mid',
-    templateId: 'medium',
-    createdAt: 1,
-    cwd: 'C:/work',
+  const fake = await mount({
+    config: { templates: TEMPLATES, maxDepth: 'provider-managed' },
+    shared: { storeRecords: new Map([['parent-1', {
+      parentSessionId: 'grandparent-1',
+      name: 'mid',
+      templateId: 'medium',
+      createdAt: 1,
+      cwd: 'C:/work',
+    }]]) },
   })
   await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
   assert.equal(fake.storeRecords.size, 2, 'the delegation proceeded past the first level')
@@ -1639,16 +1979,18 @@ check('config: the defaults are maxActiveSubagents 4 and maxDepth 1', () => {
 })
 
 check('maxActiveSubagents: refuses a delegation while the cap is full', async () => {
+  // The records exist before the row mounts: the durable medium is what a restart
+  // finds, and the store indexes it when it opens.
   const fake = await mount({
     config: { templates: TEMPLATES, maxActiveSubagents: 1 },
     liveAgents: [{ id: 'child-a', status: 'running' }],
-  })
-  fake.storeRecords.set('child-a', {
-    parentSessionId: 'parent-1',
-    name: 'a',
-    templateId: 'medium',
-    createdAt: 1,
-    cwd: 'C:/work',
+    shared: { storeRecords: new Map([['child-a', {
+      parentSessionId: 'parent-1',
+      name: 'a',
+      templateId: 'medium',
+      createdAt: 1,
+      cwd: 'C:/work',
+    }]]) },
   })
   await assert.rejects(
     () => delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false),
@@ -1661,13 +2003,13 @@ check('maxActiveSubagents: a child that has finished holds no slot', async () =>
   const fake = await mount({
     config: { templates: TEMPLATES, maxActiveSubagents: 1 },
     liveAgents: [{ id: 'child-a', status: 'idle' }],
-  })
-  fake.storeRecords.set('child-a', {
-    parentSessionId: 'parent-1',
-    name: 'a',
-    templateId: 'medium',
-    createdAt: 1,
-    cwd: 'C:/work',
+    shared: { storeRecords: new Map([['child-a', {
+      parentSessionId: 'parent-1',
+      name: 'a',
+      templateId: 'medium',
+      createdAt: 1,
+      cwd: 'C:/work',
+    }]]) },
   })
   await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
   assert.equal(fake.storeRecords.size, 2, 'a finished child must not block new work')
