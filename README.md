@@ -58,9 +58,9 @@ Every delegation carries a `name`, and that name is the child's **only handle**:
 | Where the name appears | What it does |
 | --- | --- |
 | the child's Session title | the sidebar tab, the session list, and the panel row all read the same word |
-| the `subagent` tool result | a background call returns `{ kind, name }`; no Session id ever reaches the model |
+| the `subagent` tool result | a background call returns `{ kind, name }`, plus `siblings` when the caller had other children; no Session id ever reaches the model |
 | the settlement notice | `subagent "explorer" finished.` — the parent refers to the child by this word |
-| `delete_subagent` | takes `name`, not a Session id |
+| `delete_subagent` | takes `names` — one or several — not a Session id |
 | the child's own prompt | tells the child what it is called, so `ask_parent` can speak for itself |
 
 The name is stored **verbatim**: no character set is imposed, no case folding, no
@@ -223,7 +223,7 @@ times, after which it is dropped with a warning rather than retried forever.
 | `list_subagents` | a delegating session's own scope | this session's children, by name, with template and work state |
 | `message_subagent` | a delegating session's own scope | sends a message to one of the caller's own children |
 | `interrupt_subagent` | a delegating session's own scope | stops one child's current work and keeps the child |
-| `delete_subagent` | a delegating session's own scope | the delegating agent deletes one of its own children, by name |
+| `delete_subagent` | a delegating session's own scope | the delegating agent deletes its own children by name — several names in one call, or `"*"` for all of them |
 | `ask_parent` + a parent-identity context | each child session's own scope | lets a delegated child ask its parent a question |
 | the `subagentTemplates` Session projection | the host | publishes a parent's children to the Client panel |
 | the `Subagents` right-Sidebar tab | the browser | lists this session's children, and opens or deletes one |
@@ -303,6 +303,43 @@ the same operation the panel performs. It is scoped to the caller's own children
 a name the caller never gave is refused, with a result that says so rather than
 one that names somebody else's child. To stop a child's work **without** ending
 it, use `interrupt_subagent`.
+
+### One call deletes several, and `"*"` deletes all
+
+`delete_subagent` takes **`names`**, an array, rather than one name per call. A
+parent is most often finished with several children at once — a fan-out that
+answered, plus a scope abandoned — and the cost of a rule is one call, not one
+call per child. It answers `{ deleted, notFound }`: the names it ended and the
+names it never had, so a partly-failing batch reports each name honestly instead
+of stopping at the first miss.
+
+`"*"` is the one name that means **every child this session delegated**. It is
+bounded by the same authority as any other name — the wildcard resolves against
+the caller's own mapping — so it can only ever reach that session's own children,
+never another's. It is worth stating what it costs: `*` is a destructive
+operation over whatever this session still has running, including a child whose
+answer has not arrived. Pass explicit names when the batch is known. Because the
+wildcard is resolved by name, a child actually *named* `*` is deleted by any
+wildcard call.
+
+### What a spawn tells the parent about the children it already has
+
+A delegation whose caller already has other children returns, in its tool result,
+the rows `list_subagents` would have returned — name, work state, template — plus
+the sentence that a subagent is never stopped for its parent:
+
+> started background subagent "reviewer"
+>
+> You already delegated: explorer [idle]: medium, scout [working]: high. A
+> subagent is never stopped for you, so when one is no longer needed — its answer
+> is in, or its work is off track — delete it with `delete_subagent`, which takes
+> several names in one call and `"*"` for every subagent you delegated.
+
+Both facts are needed at that moment and nowhere else: the parent's tool list
+says nothing about which children it holds, and nothing in the conversation says
+that deletion is its job alone. A **first** delegation has no other children, so
+its result carries neither, and both routes report the same way — the note
+follows a foreground call's output as well as a background call's name.
 
 That lifetime needs **two** owners, and neither is the delegating call.
 
@@ -731,7 +768,9 @@ stopped turn reporting nothing and being waited through, the two owners that kee
 a child alive (the creation signal, and the app root context it is created
 through), the three tools that
 stand in for the native ones, the scope they are installed into, adoption after a
-reload, `delete_subagent` by name, the projection rows, the mapping store, and
+reload, `delete_subagent` by name — several names in one call, and the `*`
+wildcard for every child at once — the note a spawn adds about the children the
+caller already delegated, the projection rows, the mapping store, and
 configuration rejection — against in-memory fakes, with no Harness and no model.
 Its delegation helper takes the background flag as a separate argument and refuses
 to run without it, so no probe call can quietly stop testing the call a model

@@ -17,19 +17,24 @@
  * Client does not classify the child as a subagent and hide its picker.
  *
  * Every call names its child, and that name is the child's only handle: it
- * titles the Session, it is what `delete_subagent` takes, it labels the
- * child's row in the Client panel, and every message about the child — the
+ * titles the Session, it is the word `delete_subagent` deletes it by, it labels
+ * the child's row in the Client panel, and every message about the child — the
  * settlement notice, a question the child sends up, an error — opens with it
  * rather than with the child's Session id. The name is unique among one parent's
  * live children, so a reference to a subagent is never ambiguous.
  *
  * A foreground call returns the child's output as its tool result; a background
  * call returns the child's name and delivers the output to the parent as a
- * settlement notice when the child finishes on its own terms. An interrupted
- * turn is not an outcome: a child the user stops keeps its session, so the call
- * waiting for it keeps waiting and a background watch stays armed until the
- * child's next turn ends naturally. Only deleting the child ends a background
- * watch without a result.
+ * settlement notice when the child finishes on its own terms. Either result also
+ * carries the caller's other children when it has any — the rows
+ * `list_subagents` would have answered, plus the sentence saying that nobody
+ * ends a child for its parent — because a parent that delegates again is a
+ * parent that already has children it may never delete, and the spawn is the one
+ * moment to tell it. An interrupted turn is not an outcome: a child the user
+ * stops keeps its session, so the call waiting for it keeps waiting and a
+ * background watch stays armed until the child's next turn ends naturally. Only
+ * deleting the child ends a background watch without a result. Deletion itself
+ * takes several names in one call, or `"*"` for every child the caller delegated.
  *
  * A template child is an ordinary root Session, so it is deliberately absent from
  * the Harness subagent registry. That is what keeps its model picker, and it is

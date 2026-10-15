@@ -713,12 +713,39 @@ check('list_subagents reports each child by name, template, and work', async () 
   assert.equal((await tool.execute({}, { agent: fake.parent, signal }))[0].status, 'ended')
 })
 
+check('a spawn reports the children the caller already delegated', async () => {
+  // Nothing ends a delegated child for its parent, and the parent's tool list does
+  // not say which children it holds, so the call that creates one is where the
+  // existing ones and the rule for ending them belong.
+  const fake = await mount()
+  const tool = fake.tools.get('subagent')
+  const first = await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  assert.equal(first.siblings, undefined, 'a first delegation has no other children to report')
+
+  const second = await delegate(fake, { name: 'reviewer', template: 'high', prompt: 'look' }, true)
+  assert.deepEqual(second.siblings, [{ name: 'explorer', template: 'medium', status: 'idle' }])
+  const background = tool.output.render({}, second)[0].text
+  assert.match(background, /^started background subagent "reviewer"/)
+  assert.match(background, /You already delegated: explorer \[idle\]: medium\./)
+  assert.match(background, /`delete_subagent`/)
+  assert.equal(background.includes('reviewer'), true, 'the created child is named by the result itself')
+  assert.equal(background.split('reviewer').length - 1, 1, 'and it is not listed among the children it already had')
+
+  // The foreground route reports the same rows after its own result, so neither
+  // route is the one that leaves a parent unaware of its children.
+  const third = await delegate(fake, { name: 'auditor', template: 'medium', prompt: 'look' }, false)
+  assert.deepEqual(third.siblings.map(row => row.name), ['explorer', 'reviewer'])
+  const foreground = tool.output.render({}, third)[0].text
+  assert.match(foreground, /^done/)
+  assert.match(foreground, /You already delegated: explorer \[idle\]: medium, reviewer \[idle\]: high\./)
+})
+
 check('a session that has delegated every child away still answers honestly', async () => {
   // The tool only exists because this session delegated, so its empty state is
   // reached by deleting the last child — which is also why it is never withdrawn.
   const fake = await mountWithChild()
   const signal = new AbortController().signal
-  await fake.parentTools.get('delete_subagent').execute({ name: 'explorer' }, { agent: fake.parent, signal })
+  await fake.parentTools.get('delete_subagent').execute({ names: ['explorer'] }, { agent: fake.parent, signal })
   const tool = fake.parentTools.get('list_subagents')
   const rows = await tool.execute({}, { agent: fake.parent, signal })
   assert.deepEqual(rows, [])
@@ -887,7 +914,7 @@ check('a name already in use is refused, and the first child is untouched', asyn
 
   // Deleting it frees the name again.
   await fake.parentTools.get('delete_subagent').execute(
-    { name: 'reviewer' },
+    { names: ['reviewer'] },
     { agent: fake.parent, signal: new AbortController().signal },
   )
   const second = await delegate(fake, { name: 'reviewer', template: 'high', prompt: 'look' }, false)
@@ -966,7 +993,9 @@ check('background: the call returns the name immediately and is registered', asy
   const value = await delegate(fake, {
     name: 'explorer', template: 'medium', prompt: 'look',
   }, true)
-  assert.deepEqual(value, { kind: 'background', name: 'explorer' })
+  // `siblings` carries this caller's other children; there are none on a first
+  // delegation, so it is absent rather than an empty list.
+  assert.deepEqual(value, { kind: 'background', name: 'explorer', siblings: undefined })
   // No session id reaches the model: the name is the only handle it gets.
   assert.equal(value.sessionId, undefined)
   const [, create] = fake.created.find(entry => entry[0] === 'create')
@@ -1065,26 +1094,53 @@ check('a child keeps running when the parent session is disposed', async () => {
   assert.equal(fake.created.some(entry => entry[0] === 'dispose'), false)
 })
 
-check('delete_subagent finds the child by name and touches only the caller\'s own', async () => {
+check('delete_subagent deletes the caller\'s own children by name, several at once', async () => {
   const fake = await mount()
-  const value = await delegate(fake, {
-    name: 'explorer', template: 'medium', prompt: 'look',
-  }, true)
-  const [, create] = fake.created.find(entry => entry[0] === 'create')
+  await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  await delegate(fake, { name: 'reviewer', template: 'high', prompt: 'look' }, true)
+  const creates = fake.created.filter(entry => entry[0] === 'create').map(([, options]) => options.sessionId)
   const tool = fake.parentTools.get('delete_subagent')
   const signal = new AbortController().signal
-  // A name the caller never gave is refused, naming nothing of anyone's.
-  const stranger = await tool.execute({ name: 'not-mine' }, { agent: fake.parent, signal })
-  assert.deepEqual(stranger, { name: 'not-mine', deleted: false })
-  assert.equal(fake.archived.length, 0)
 
+  // A name the caller never gave is refused beside the ones it did, and it names
+  // nothing of anyone's: one call, one honest answer per name.
+  const mixed = await tool.execute({ names: ['not-mine', 'explorer'] }, { agent: fake.parent, signal })
+  assert.deepEqual(mixed, { deleted: ['explorer'], notFound: ['not-mine'] })
+  assert.deepEqual(fake.archived, [creates[0]])
+  assert.deepEqual(tool.output.render({}, mixed), [{
+    type: 'text',
+    text: 'deleted subagent "explorer"; no subagent named "not-mine" is running for you',
+  }])
+
+  // A name repeated in one call is still one child, ended once.
+  const rest = await tool.execute({ names: ['reviewer', 'reviewer'] }, { agent: fake.parent, signal })
+  assert.deepEqual(rest, { deleted: ['reviewer'], notFound: [] })
+  assert.deepEqual(tool.output.render({}, rest), [{ type: 'text', text: 'deleted subagent "reviewer"' }])
   // The caller's own child is deleted: cancelled, disposed, and archived.
-  const own = await tool.execute({ name: value.name }, { agent: fake.parent, signal })
-  assert.deepEqual(own, { name: 'explorer', deleted: true })
   assert.ok(fake.created.some(entry => entry[0] === 'cancel'))
   assert.ok(fake.created.some(entry => entry[0] === 'dispose'))
-  assert.ok(fake.archived.includes(create.sessionId))
-  assert.equal(fake.storeRecords.has(create.sessionId), false)
+  assert.deepEqual(fake.archived, [creates[0], creates[1]])
+  assert.equal(fake.storeRecords.size, 0)
+})
+
+check('delete_subagent ends every child of the caller for "*"', async () => {
+  const fake = await mount()
+  await delegate(fake, { name: 'explorer', template: 'medium', prompt: 'look' }, true)
+  await delegate(fake, { name: 'reviewer', template: 'high', prompt: 'look' }, true)
+  const tool = fake.parentTools.get('delete_subagent')
+  const signal = new AbortController().signal
+
+  const all = await tool.execute({ names: ['*'] }, { agent: fake.parent, signal })
+  assert.deepEqual(all, { deleted: ['explorer', 'reviewer'], notFound: [] })
+  assert.equal(fake.storeRecords.size, 0)
+  assert.deepEqual(tool.output.render({}, all), [{ type: 'text', text: 'deleted subagents "explorer", "reviewer"' }])
+
+  // The wildcard is bounded by the caller's own mapping, so a caller with no
+  // children left has nothing it can reach.
+  const again = await tool.execute({ names: ['*'] }, { agent: fake.parent, signal })
+  assert.deepEqual(again, { deleted: [], notFound: [] })
+  assert.deepEqual(tool.output.render({}, again), [{ type: 'text', text: 'no subagent was deleted' }])
+  assert.equal(fake.archived.length, 2)
 })
 
 check('an interrupted turn is not an outcome: the stopped turn reports nothing', async () => {
@@ -1167,7 +1223,7 @@ check('background: deleting the child ends its settlement watch', async () => {
   fake.child.cancel({ kind: 'user' })
   await tick()
   await fake.parentTools.get('delete_subagent').execute(
-    { name: 'explorer' },
+    { names: ['explorer'] },
     { agent: fake.parent, signal: new AbortController().signal },
   )
   // A deleted child can never settle, so its watch must not stay armed: a turn
