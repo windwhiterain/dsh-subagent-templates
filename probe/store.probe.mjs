@@ -140,6 +140,20 @@ check('a record with no name in either form is refused', () => {
   assert.throws(() => parse([CURRENT]), /must be an object/)
 })
 
+check('the delivered turn count is carried, optional, and checked', () => {
+  const parse = MAPPING_DOMAIN.tables[TABLE].valueSchema.parse
+  // Absent on a record written before the counter existed: read without it, and
+  // the next write adds it. That is the whole backward-compatibility claim.
+  assert.equal('reportedTurns' in parse(CURRENT), false)
+  const counted = { ...CURRENT, reportedTurns: 3 }
+  assert.equal(parse(counted).reportedTurns, 3)
+  // It survives a round trip through the reader, which is what stops a re-armed
+  // watch from starting a child's count back at zero.
+  assert.equal(parse(parse(counted)).reportedTurns, 3)
+  assert.throws(() => parse({ ...CURRENT, reportedTurns: -1 }), /reportedTurns must be a non-negative integer/)
+  assert.throws(() => parse({ ...CURRENT, reportedTurns: 1.5 }), /reportedTurns must be a non-negative integer/)
+})
+
 check('a fresh unit round-trips a record and stamps the current version', async () => {
   const { records } = await openValidated(ROOT)
   assert.deepEqual(records, {})

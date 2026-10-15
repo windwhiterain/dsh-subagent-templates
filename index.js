@@ -48,6 +48,16 @@
  * whose inherited-context child would be a second kind of object with a second
  * lifecycle.
  *
+ * All of that lives on an **Agent**, and an Agent is not durable: a hot reload
+ * keeps it, a restart replaces every one of them with a fresh Agent the moment
+ * the user opens that Session. So none of it is left to activation time. Each
+ * Session that appears is reconciled against the mapping store in whichever role
+ * it plays — a delegating session recovers its four tools, a delegated one
+ * recovers its `ask_parent` and its settlement watch — and a re-armed watch
+ * resumes from the durable count of turns the parent has already been told
+ * about, so a turn that ended while the Host was down is delivered once, and
+ * never a turn it already has.
+ *
  * Every message this plugin hands to another Session goes through one channel
  * (`./lib/delivery.js`), which picks the route the recipient's own state requires:
  * a delivery that opens a turn keeps the attribution the Client draws a turn
@@ -376,8 +386,11 @@ export async function apply(ctx, rawConfig) {
     const { childSessionId, mapping } = entry
     const child = control.agents?.get(childSessionId)
     if (child === undefined) return
-    installParentChannel(ctx, child.ctx, mapping.parentSessionId, mapping.name, deliveries)
+    // One pass per child per instance. A Session can be reconciled twice — once
+    // as a parent that has children, once as a child of somebody — and a second
+    // pass would register nothing while still leaving two inert fibers behind.
     if (childWatches.has(childSessionId)) return
+    installParentChannel(ctx, child.ctx, mapping.parentSessionId, mapping.name, deliveries)
     const watch = watchChildSettlement(ctx, {
       name: mapping.name,
       sessionId: childSessionId,

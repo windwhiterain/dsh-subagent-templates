@@ -159,8 +159,16 @@ The child also keeps the deployment's `send_message`, and the context says
 plainly that this route cannot reach the delegating Session. It is deliberately
 **not** withdrawn: a template child holds `subagent_fork` (in the `personal`
 preset), which creates a *continuable* child, and `send_message` is the working
-route to that one. Denying it on every child would remove a capability that
-works.
+route to that one. Denying it for an unrelated reason would remove a capability
+that works.
+
+Both registrations live in the child's *creation* scope, so they belong to the
+Agent that creation made. A Session the Host resumed later — after a restart, or
+under a reloaded plugin row — arrives as a different Agent with neither, and the
+mapping record is all that still says which session delegated it. The plugin
+teaches such a child again when it sees the Agent appear; a scope that already
+carries `ask_parent` refuses the second registration, and that refusal is the
+"already taught" answer rather than a failure.
 
 ## Every message takes the route the recipient's own state requires
 
@@ -255,7 +263,9 @@ Two consequences worth stating plainly:
 A hot reload replaces this plugin while the children it recorded are still in the
 store, so activation adopts the live sessions that already have children — found
 through the Agent registry and the mapping store. Without that, a reloaded session
-would keep working and silently have no way to manage what it delegated.
+would keep working and silently have no way to manage what it delegated. What
+that adoption cannot cover on its own is a **restart**, which brings no Agent
+back at all until the user opens one; see "What a restart changes" below.
 
 Those four tools live in the **Agent's** scope rather than this plugin's, so they
 outlive the instance that registered them and the teardown that ends an instance
@@ -265,6 +275,42 @@ nothing — and leave the session calling tools bound to the closed mapping doma
 Adoption therefore keeps the registration's own disposer and runs it on unload,
 and a registration the scope refuses leaves the session unmarked, so a later
 delegation may adopt instead of the session losing the tools for good.
+
+## What a restart changes, and what it must not
+
+Both an agent-scoped registration and a settlement watch belong to one **Agent**,
+so both die with it. A hot reload keeps the Agents, which is why a reload was
+always survivable; a restart does not, and the Sessions come back as *different*
+Agents, one at a time, whenever the user opens them. A Host resumes no Session
+before it loads plugins, so anything this plugin does only while loading sees
+nothing at all on a cold start.
+
+So the work is re-derived per Agent instead, from `agent/created`, in whichever
+role that Session plays:
+
+- a session that has **delegated** gets its four tools back, from the mapping
+  store's answer to "does this session have children";
+- a session that **was delegated** gets its `ask_parent` back and a settlement
+  watch armed over its turns.
+
+Each watch resumes from a count, not from zero. A re-armed watch has two halves
+to its memory of what the parent already has: the child's own log says how many
+turns have ended, and the mapping record's `reportedTurns` says how many of them
+reached the parent. "The child's log is ahead of the record" is exactly "there is
+a finished turn the parent has not been told about", which is what makes a turn
+that ended while the Host was down delivered **once**, when the parent comes
+back, instead of lost or repeated. A record written before that counter existed
+carries none, and is read as "everything the log holds" rather than as zero, so
+an older delegation is never replayed.
+
+The same wait decides what happens while the parent is *closed*: a notice with
+no Agent to land in is held rather than dropped, and delivered when that Session
+is resumed. Only an ended delegation gives up on it.
+
+A restart therefore costs a session nothing it can still act on. What it does
+cost is in-flight work: a turn running in a child dies with the process, exactly
+as it would anywhere else, and a foreground delegation that was waiting on it
+loses its tool result and reports through the notice route instead.
 
 ## The panel
 
@@ -653,13 +699,13 @@ rather than a second route to the same children.
   not registered with `ctx.subagents`, so `send_message`, `list_agents`, and the
   team panel do not see it. Open the child's own tab to talk to it.
 - **A child that outlived this plugin keeps running with no handle in memory.** A
-  reloaded instance rebuilds the mapping and the parent's tools, but the
-  `AgentHandle` that created the child died with the previous instance, so
-  `delete_subagent` stops such a child through the shipped archive-with-stop path
-  (the Agent registry answers `workspace/session-stop` by cancelling its turn)
-  rather than by disposing a handle it no longer holds. The Agent object itself
-  stays registered, idle and archived, until the process exits — the residue the
-  shipped panel already leaves for any archived Session.
+  reloaded instance rebuilds the mapping, the parent's tools, and the child's
+  watch, but the `AgentHandle` that created the child died with the previous
+  instance, so `delete_subagent` stops such a child through the shipped
+  archive-with-stop path (the Agent registry answers `workspace/session-stop` by
+  cancelling its turn) rather than by disposing a handle it no longer holds. The
+  Agent object itself stays registered, idle and archived, until the process
+  exits — the residue the shipped panel already leaves for any archived Session.
 - **No per-call model override.** A call names a template and nothing else, by
   design; a pool template's route is resolved by the pool, and changing the
   child's model afterwards is the user's action in its picker.
@@ -696,8 +742,11 @@ rather than a second route to the same children.
 
 The mapping lives in the `subagent_templates` storage domain, one record per
 delegated child, keyed by the child's Session id. The record names its parent, the
-name the parent gave it, the template it ran under, the time, and the working
-directory.
+name the parent gave it, the template it ran under, the time, the working
+directory, and `reportedTurns` — how many of that child's ended turns have
+already reached its parent. That last one is what makes a settlement survive a
+restart, and it is written only after a notice has actually been handed over, so
+it never runs ahead of what the parent has.
 
 The record's identity field changed from `label` to `name` when the naming
 requirement arrived, and the **unit version did not move**. That is deliberate: a
@@ -707,7 +756,15 @@ as the name and the record is rewritten in the new form on the next write. A new
 reader that accepts both records and always writes the current one is a
 backward-compatible change, not a migration — so there is no version to declare
 compatible, no record to back up, and no unit to move to another layout. The
-unit's version can be raised later, once no old record remains.
+unit's version can be raised later, once no old record remains. `reportedTurns`
+was added the same way: a record that has none is read without it, and the
+watch that resumes from it falls back to the child's own log rather than to
+zero, so nothing already delivered is ever repeated.
+
+Records are indexed by parent as they are read and written. The question asked
+most often — does this Session have children — is asked of every Agent the Host
+creates, and it must not cost a scan of the whole domain; this plugin is the only
+writer of that table, so the index cannot fall behind the medium.
 
 `probe/store.probe.mjs` opens the profile's real `subagent_templates.json` with
 this plugin's own spec, through the Harness's own JSON storage backend, and
@@ -740,8 +797,11 @@ application root context rather than this plugin's (see "A child is never reaped
 automatically"); a child that dies `disposed` anyway means that rule has been
 broken again. So does everything that has to outlive the entry: the settlement
 delivery and the child's `ask_parent` read the Agent registry through that same
-root context, and an armed settlement watch lives on the child's own scope, so a
-template edit mid-delegation neither loses a child's result nor strands it.
+root context. A watch does **not** outlive the entry — its teardown stops it —
+because the replacement arms one of its own from the durable `reportedTurns`
+count, and two watches on one child would report every turn twice. What that
+costs is only the waiting: a template edit mid-delegation reports through the
+replacement's watch instead of stranding the child.
 
 The host also has no way to load a plugin's client half unless its `package.json`
 declares the `./client` export and the `dsh.client` manifest; a client file that
@@ -768,7 +828,13 @@ stopped turn reporting nothing and being waited through, the two owners that kee
 a child alive (the creation signal, and the app root context it is created
 through), the three tools that
 stand in for the native ones, the scope they are installed into, adoption after a
-reload, `delete_subagent` by name — several names in one call, and the `*`
+reload, adoption after a **restart** — no Agent live at load, then the user's
+sessions coming back one at a time — a settlement that survives one, a turn that
+ended while the parent Session was closed, a legacy record with no
+`reportedTurns`, `ask_parent` restored on a resumed child and installed only
+once, one watch per child whoever created it, the reload handoff, a deleted child
+that this instance never created, `delete_subagent` by name — several names in
+one call, and the `*`
 wildcard for every child at once — the note a spawn adds about the children the
 caller already delegated, the projection rows, the mapping store, and
 configuration rejection — against in-memory fakes, with no Harness and no model.

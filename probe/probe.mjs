@@ -75,7 +75,11 @@ function toolApi(agent) {
   const tools = scopeTools(agent)
   return {
     register: (definition) => {
-      if (tools.has(definition.name)) throw new Error(`duplicate scoped tool ${definition.name}`)
+      if (tools.has(definition.name)) {
+        // The Host's own refusal, in its own words: a scope holds one definition
+        // per name, and that refusal is what "already adopted" looks like.
+        throw new Error(`tool "${definition.name}" is already registered in this scope`)
+      }
       tools.set(definition.name, definition)
       return () => tools.delete(definition.name)
     },
@@ -197,22 +201,47 @@ function harness(options = {}) {
     composedPreset: () => 'personal',
   }
 
+  const promptApi = (kind) => (contribution) => {
+    const scope = childScopeOf(child)
+    if (scope.prompts.has(contribution.name)) {
+      throw new Error(`prompt ${kind} "${contribution.name}" is already registered in this scope`)
+    }
+    scope.prompts.add(contribution.name)
+    created.push([kind === 'context' ? 'context' : 'persona', contribution])
+    return () => scope.prompts.delete(contribution.name)
+  }
   const systemPromptApi = {
-    context: (contribution) => { created.push(['context', contribution]); return () => {} },
-    section: (contribution) => { created.push(['persona', contribution]); return () => {} },
+    context: promptApi('context'),
+    section: promptApi('section'),
     getContextOrder: () => 500,
     getSectionOrder: () => 100,
   }
 
-  // The child-scope tool registry, so a child-scoped tool (ask_parent) is
-  // recorded exactly where the real one would land.
-  const childTools = new Map()
+  // Every child Session is its own Agent with its own scope, so the tool and
+  // prompt registrations a child makes are that child's alone — and a second
+  // child never collides with the first. The Host refuses one definition per
+  // name per scope, in those words, and that refusal is what "this Agent is
+  // already taught" looks like; a probe that does not model it would pass a
+  // re-installation the Host refuses.
+  const childScopes = new Map()
+  const childScopeOf = (agent) => {
+    const existing = childScopes.get(agent.id)
+    if (existing !== undefined) return existing
+    const scope = { tools: new Map(), prompts: new Set() }
+    childScopes.set(agent.id, scope)
+    return scope
+  }
+
   const childToolApi = {
     register: (definition) => {
-      childTools.set(definition.name, definition)
-      return () => childTools.delete(definition.name)
+      const scope = childScopeOf(child)
+      if (scope.tools.has(definition.name)) {
+        throw new Error(`tool "${definition.name}" is already registered in this scope`)
+      }
+      scope.tools.set(definition.name, definition)
+      return () => scope.tools.delete(definition.name)
     },
-    get: (name) => childTools.get(name),
+    get: (name) => childScopeOf(child).tools.get(name),
     restrict: (restriction) => { created.push(['restrict', restriction]) },
   }
 
@@ -614,9 +643,11 @@ function harness(options = {}) {
   }
 
   return {
-    ctx, parent, child, agentsApi, tools, parentTools, childTools, listeners, disposers, created, attached,
+    ctx, parent, child, agentsApi, tools, parentTools, listeners, disposers, created, attached,
     delivered, warnings, errors, settingsPresentations, store, storeRecords, requestResolvers, archived, renamed, projections, execSignal: undefined,
     facility, root, resumeChild, resumeSession, dropClaimedFromParent, parentInbox, childInbox,
+    /** The tools the current child's own scope holds, keyed by name. */
+    get childTools() { return childScopeOf(child).tools },
     /** The context the last delegation created its child through: `'root'` or `'plugin'`. */
     get createdBy() { return createdBy },
   }
