@@ -1434,8 +1434,9 @@ check('background: the call returns the name immediately and is registered', asy
     name: 'explorer', template: 'medium', prompt: 'look',
   }, true)
   // `siblings` carries this caller's other children; there are none on a first
-  // delegation, so it is absent rather than an empty list.
-  assert.deepEqual(value, { kind: 'background', name: 'explorer', siblings: undefined })
+  // delegation, so the key is absent rather than an empty list — a present
+  // `undefined` is not lossless JSON and the tool-result snapshot rejects it.
+  assert.deepEqual(value, { kind: 'background', name: 'explorer' })
   // No session id reaches the model: the name is the only handle it gets.
   assert.equal(value.sessionId, undefined)
   const [, create] = fake.created.find(entry => entry[0] === 'create')
