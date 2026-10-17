@@ -563,12 +563,28 @@ child's preset already admits and never widens it.
 ### `maxDepth`
 
 `maxDepth` bounds how deep delegation may nest, and **defaults to 1**: a session
-may delegate, and a child of that delegation may not delegate again. A delegation
-is refused when it would create a child deeper than the cap, counting a session
-that has delegated nothing as depth 0, so its child is depth 1. Set it higher, or
-to `provider-managed` to state that the bound belongs to the delegation provider
-— this plugin delegates to ordinary root Sessions and mounts no provider, so it
-enforces nothing for that value.
+may delegate, and a child of that delegation may not delegate again. A session is
+counted at depth 0 when it has delegated nothing, so its child is depth 1. Set it
+higher, or to `provider-managed` to state that the bound belongs to the delegation
+provider — this plugin delegates to ordinary root Sessions and mounts no
+provider, so it enforces nothing for that value.
+
+A session the cap has closed is not **given** `subagent` or
+`list_subagent_templates` in the first place. Withholding them is the shape this
+takes because a refusal is not: a session carrying a tool it can only fail with
+pays for it on every turn, in a tool error the model has to interpret each time,
+for a fact that cannot change. The two tools are denied on that session's own
+scope and nowhere else, so a top-level session under the same row still
+delegates, and a session that has children keeps
+`list_subagents` / `message_subagent` / `interrupt_subagent` / `delete_subagent`
+— it may not open more, but it can still manage the ones it has.
+
+The depth is decided when the child is created, inside its own creation window,
+because the record naming it a child is not written until the delegating call
+returns; a session that reaches the cap some other way — one the host resumed
+after a restart — is judged from the recorded chain instead. `maxDepth` is
+editable live, so the restriction is reversible: raising the cap hands the tools
+back to every session it had closed.
 
 A template child carries no `parentSession` header — that omission is what keeps
 its model picker — so the Harness cannot answer its depth. The plugin counts it by

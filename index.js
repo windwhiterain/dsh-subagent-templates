@@ -71,6 +71,13 @@
  * mapping store, since a template child carries no `parentSession` header for
  * the Harness to count from.
  *
+ * A depth cap is applied by WITHHOLDING rather than by refusing: a session the
+ * cap has closed never receives `subagent` or `list_subagent_templates`, because
+ * a tool it can only fail with costs a tool error on every turn for a fact that
+ * cannot change. The restriction lives on that session's own scope, is decided
+ * from the recorded chain for a session this instance did not create, and is
+ * lifted again if the live-editable cap is raised.
+ *
  * This plugin imports no Harness package: out-of-tree bundles resolve from the
  * profile, which does not put the Harness's own modules on this package's
  * resolution path. Its one dependency is the schema library
@@ -90,7 +97,9 @@ import {
   createSubagentListTool,
   createSubagentMessageTool,
   createTemplateListTool,
+  withheldDelegationTools,
 } from './lib/tool.js'
+import { childDepthOf } from './lib/limits.js'
 import { openMappingStore } from './lib/store.js'
 import { childrenProjection } from './lib/projection.js'
 import { installParentChannel, turnsEnded, watchChildSettlement } from './lib/session-delegate.js'
@@ -255,6 +264,35 @@ export async function apply(ctx, rawConfig) {
   const childToolScopes = new Map()
 
   /**
+   * The depth-cap restriction each session currently carries, keyed by Session id.
+   *
+   * Held per session rather than installed once globally, because a cap is
+   * counted from each session's own position in the recorded chain: the same row
+   * admits a top-level session and closes a child of it. The value is a holder
+   * whose `dispose` the deferred registration fills in, so a cap raised later can
+   * lift exactly this restriction and no other.
+   */
+  const depthCaps = new Map()
+
+  /**
+   * The configuration the running registrations were built from.
+   *
+   * `registerTemplateTools` is the writer and `applyDepthCap` the reader, and the
+   * two must agree: a session reconciled against a stale cap would be denied tools
+   * the row no longer forbids. It is replaced together with the registrations.
+   */
+  let current = initial
+
+  /**
+   * Whether this instance's teardown has run.
+   *
+   * A reload activates the replacement while this one is still unwinding, so work
+   * that lands in the gap — a child whose creation window closes after the
+   * disposer ran — must not register state the teardown will never see.
+   */
+  let unloaded = false
+
+  /**
    * The settlement watch each recorded child currently has, keyed by that
    * child's Session id.
    *
@@ -368,6 +406,95 @@ export async function apply(ctx, rawConfig) {
   }
 
   /**
+   * Withhold the delegation tools from one session that the depth cap has closed.
+   *
+   * A session at the cap must not be handed a tool it can only fail with: the
+   * refusal would arrive as a tool error the model has to interpret, on every
+   * turn, for a fact that never changes. So the tools are denied on that
+   * session's own scope, and the call-time check inside the delegation tool stays
+   * as the authority for a cap that moved after this session's tools were
+   * assembled.
+   *
+   * The deny is reversible, because `maxDepth` is a volatile setting: raising the
+   * cap has to hand the tools back, or a session that may delegate again would
+   * still carry none. The entry is therefore keyed by session id and holds the
+   * exact disposer `restrict()` returns.
+   *
+   * @param agent - the live Agent whose scope is being narrowed.
+   * @param withheld - the tool names to deny, or undefined to leave the scope alone.
+   */
+  const applyDepthCap = (agent, withheld) => {
+    const active = depthCaps.get(agent.id)
+    if (withheld === undefined) {
+      // The cap now admits this session's children again, so the tools go back.
+      if (active === undefined) return
+      depthCaps.delete(agent.id)
+      active.dispose()
+      return
+    }
+    // Already withheld, and by the same names: a Settings edit that re-registers
+    // the row re-reconciles every session, and re-denying would stack a second
+    // restriction on one that is already correct.
+    if (active !== undefined) return
+    const holder = { dispose: () => {} }
+    depthCaps.set(agent.id, holder)
+    agent.ctx.inject(['tools'], (toolCtx) => {
+      const dispose = toolCtx.tools.restrict({ deny: withheld })
+      holder.dispose = dispose
+      // This instance's teardown clears the entry before the fiber lands, so a
+      // restriction installed after that unload must not outlive it — the same
+      // ordering the four adopted tools rely on.
+      if (!depthCaps.has(agent.id)) dispose()
+    })
+  }
+
+  /**
+   * Record the cap a brand new child's own creation window already applied.
+   *
+   * A new child is denied inside `setup`, before its first model request and
+   * before its mapping record exists, so there is no later moment at which the
+   * depth could have been read to reach the same decision. Registering the deny
+   * here is what makes it reversible afterwards: without an entry, a later
+   * reconcile or a raised cap would find nothing to lift and this session would
+   * carry no delegation tools for the rest of its life.
+   * @param sessionId - the new child's Session id.
+   * @param holder - the disposer holder for the restriction it installed.
+   */
+  const claimDepthCap = (sessionId, holder) => {
+    if (depthCaps.has(sessionId)) return
+    depthCaps.set(sessionId, holder)
+    // The instance may have unloaded between the child's creation and this call,
+    // which disposes every entry it held. A deny this instance did not own must
+    // not be left behind by a teardown that never knew of it.
+    if (unloaded) holder.dispose()
+  }
+
+  /**
+   * Bring one session's delegation tools in line with the cap, from the durable
+   * record rather than from anything the call that created it knew.
+   *
+   * This is the path a session takes that never ran a delegating call in this
+   * process: one the host resumed after a restart, or one a reload re-adopted.
+   * The mapping store is what still says how deep it sits, so the depth is read
+   * from the chain rather than assumed.
+   *
+   * An unanswerable depth is not a refusal — the same rule the call-time check
+   * follows — but it is ALSO not permission to withdraw, because a child whose
+   * record has not been written yet is exactly that state: it is created, its
+   * `agent/created` announcement fires, and its delegation depth only becomes
+   * readable once the delegating call returns. That is why the cap for a NEW
+   * child is decided by the call that created it, inside the child's own creation
+   * window, and recorded through {@link claimDepthCap}: this reconcile must never
+   * undo a deny it cannot yet justify.
+   * @param agent - the live Agent to reconcile.
+   */
+  const reconcileDepthCap = (agent) => {
+    const depth = childDepthOf(store, agent.id)
+    if (depth === undefined) return
+    applyDepthCap(agent, withheldDelegationTools(current.maxDepth, depth, current.toolName))
+  }
+
+  /**
    * Teach one recorded child what it is again, and give it back its watch.
    *
    * A child this instance did not create — one whose Session the host resumed
@@ -421,6 +548,9 @@ export async function apply(ctx, rawConfig) {
     for (const entry of store?.childrenOf(agent.id) ?? []) adoptRecordedChild(entry)
     const mapping = store?.get(agent.id)
     if (mapping !== undefined) adoptRecordedChild({ childSessionId: agent.id, mapping })
+    // Unconditional, and last: a session that never delegated still sits at some
+    // depth, and a cap that has closed on it is true of the empty case too.
+    reconcileDepthCap(agent)
   }
 
   // A session this plugin never delegated in: whatever is already live when the
@@ -443,6 +573,11 @@ export async function apply(ctx, rawConfig) {
     // has to go with it: a Session resumed later arrives under the same id, and
     // a stale entry would tell it it had already been adopted.
     childToolScopes.delete(agent.id)
+    // The cap restriction lives in that same unwinding scope, so its entry goes
+    // with it for the same reason — and it is NOT disposed here, because the
+    // scope is what carries it away. A session resumed later is reconciled again
+    // from the durable record and re-denied only if the cap still says so.
+    depthCaps.delete(agent.id)
     // A watch on this child was observing an Agent that no longer exists, so it
     // can never see another turn. Its parent's watch is left alone: a parent
     // Session going away is not a reason to forget what its child owes it.
@@ -466,28 +601,39 @@ export async function apply(ctx, rawConfig) {
    * template the row no longer has.
    */
   let templateRegistrations = []
-  const registerTemplateTools = (current) => {
+  const registerTemplateTools = (config) => {
     for (const dispose of templateRegistrations) dispose()
-    templateNames = new Map(current.templates.map(template => [template.id, template.name]))
+    current = config
+    templateNames = new Map(config.templates.map(template => [template.id, template.name]))
     templateRegistrations = [
       ctx.tools.register(createDelegationTool({
         ctx,
-        toolName: current.toolName,
-        templates: current.templates,
+        toolName: config.toolName,
+        templates: config.templates,
         store,
         claimName,
         onDelegated: adoptChildTools,
+        claimDepthCap,
         trackWatch,
         waitForParent,
         registerChild,
         deliveries,
-        maxDepth: current.maxDepth,
-        maxActiveSubagents: current.maxActiveSubagents,
+        maxDepth: config.maxDepth,
+        maxActiveSubagents: config.maxActiveSubagents,
       })),
-      ctx.tools.register(createTemplateListTool(current.templates)),
+      ctx.tools.register(createTemplateListTool(config.templates)),
     ]
   }
   registerTemplateTools(initial)
+  /**
+   * Re-decide the cap for every live session against the configuration that now
+   * holds. A raised cap lifts the restrictions it put in place and a lowered one
+   * puts them back, and both are reversible precisely because each deny was taken
+   * with the exact disposer `restrict()` returned.
+   */
+  const reconcileAllDepthCaps = () => {
+    for (const agent of control.agents?.list() ?? []) reconcileDepthCap(agent)
+  }
   ctx.effect(() => () => {
     for (const dispose of templateRegistrations) dispose()
   }, `${name}.tools`)
@@ -510,6 +656,10 @@ export async function apply(ctx, rawConfig) {
       return
     }
     registerTemplateTools(next)
+    // The cap moved, so every live session's own depth is re-read against it.
+    // Template edits alone change no depth, but re-deciding here is what keeps
+    // the two derivations from drifting apart over a row's lifetime.
+    reconcileAllDepthCaps()
   })
 
   // This row ships a page of its own (`client.js`), which is where those volatile
@@ -544,8 +694,15 @@ export async function apply(ctx, rawConfig) {
   // children themselves deliberately keep running: a code reload must never
   // destroy a subagent mid-task.
   ctx.effect(() => async () => {
+    unloaded = true
     for (const holder of childToolScopes.values()) holder.dispose()
     childToolScopes.clear()
+    // The cap restrictions live on the agents' fibers, exactly as the four adopted
+    // tools do, so this instance is what takes them back. A replacement re-decides
+    // each one from the same durable record, so lifting them here cannot leave a
+    // session with no cap and no replacement to install one.
+    for (const holder of depthCaps.values()) holder.dispose()
+    depthCaps.clear()
     // A watch left armed would report through a closed mapping domain and, once
     // its replacement armed one beside it, twice. What it owed is not lost: the
     // delivered count is durable, so the next instance resumes from where this

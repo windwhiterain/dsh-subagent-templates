@@ -73,6 +73,7 @@ function scopeTools(agent) {
  */
 function toolApi(agent) {
   const tools = scopeTools(agent)
+  const restrictions = scopeRestrictions(agent)
   return {
     register: (definition) => {
       if (tools.has(definition.name)) {
@@ -84,7 +85,34 @@ function toolApi(agent) {
       return () => tools.delete(definition.name)
     },
     get: (toolName) => tools.get(toolName),
+    // A restriction filters what this scope INHERITS, which is every global tool
+    // and every ancestor's — never what the scope registers itself. That is the
+    // whole mechanism the depth cap uses, so the fake has to model it: the
+    // delegation tools are registered by the plugin's own global ctx and are
+    // removed from this agent's view, while the four adopted tools are registered
+    // HERE and must survive the very same filter.
+    restrict: (restriction) => {
+      restrictions.push(restriction)
+      return () => {
+        const index = restrictions.indexOf(restriction)
+        if (index >= 0) restrictions.splice(index, 1)
+      }
+    },
   }
+}
+
+/**
+ * The restrictions one Agent's scope currently carries, in the order applied.
+ *
+ * A property of the AGENT rather than of an instance: an Agent outlives every
+ * plugin instance, so a restriction one instance installed is what its
+ * replacement finds.
+ * @param agent - the Agent whose scope this is.
+ * @returns that Agent's active restriction list.
+ */
+function scopeRestrictions(agent) {
+  agent.toolRestrictions ??= []
+  return agent.toolRestrictions
 }
 
 /**
@@ -223,11 +251,20 @@ function harness(options = {}) {
   // name per scope, in those words, and that refusal is what "this Agent is
   // already taught" looks like; a probe that does not model it would pass a
   // re-installation the Host refuses.
+  //
+  // The child's tool map IS the Agent's own `toolScope`, the one every other live
+  // Agent uses. A second copy here would let a probe read a scope that no longer
+  // matches the one the plugin registered into — and whether a tool is injected
+  // is exactly the fact that has to be read off the real scope.
   const childScopes = new Map()
   const childScopeOf = (agent) => {
     const existing = childScopes.get(agent.id)
     if (existing !== undefined) return existing
-    const scope = { tools: new Map(), prompts: new Set() }
+    const scope = {
+      tools: scopeTools(agent),
+      prompts: new Set(),
+      restrictions: scopeRestrictions(agent),
+    }
     childScopes.set(agent.id, scope)
     return scope
   }
@@ -242,7 +279,19 @@ function harness(options = {}) {
       return () => scope.tools.delete(definition.name)
     },
     get: (name) => childScopeOf(child).tools.get(name),
-    restrict: (restriction) => { created.push(['restrict', restriction]) },
+    // Records the call for the probes that assert on a template's own filter, and
+    // models what the Host does with it: a restriction filters what this scope
+    // INHERITS, so it removes a globally registered delegation tool from the
+    // child's view without touching `ask_parent`, which is registered here.
+    restrict: (restriction) => {
+      created.push(['restrict', restriction])
+      const scope = childScopeOf(child)
+      scope.restrictions.push(restriction)
+      return () => {
+        const index = scope.restrictions.indexOf(restriction)
+        if (index >= 0) scope.restrictions.splice(index, 1)
+      }
+    },
   }
 
   // The two live Agents' pending inboxes. The delivery channel reads them to tell
@@ -648,6 +697,30 @@ function harness(options = {}) {
     facility, root, resumeChild, resumeSession, dropClaimedFromParent, parentInbox, childInbox,
     /** The tools the current child's own scope holds, keyed by name. */
     get childTools() { return childScopeOf(child).tools },
+    /**
+     * Every tool name one Agent's model request would carry.
+     *
+     * This is what a probe has to read to test an injection decision: the
+     * delegation tools live in the plugin's global registry, so they are in every
+     * session's view until a restriction on that session's own scope removes
+     * them. A scope's OWN registrations are never filtered, so a name this
+     * session registered itself is reported whatever the restrictions say.
+     * @param agent - the Agent whose view to resolve.
+     * @returns the visible tool names.
+     */
+    visibleTools(agent) {
+      const restrictions = scopeRestrictions(agent)
+      const visible = new Set()
+      for (const name of tools.keys()) {
+        const denied = restrictions.some(filter => (filter.allow !== undefined && !filter.allow.includes(name))
+          || (filter.deny !== undefined && filter.deny.includes(name)))
+        if (!denied) visible.add(name)
+      }
+      for (const name of scopeTools(agent).keys()) visible.add(name)
+      return visible
+    },
+    /** The restrictions one Agent's scope currently carries. */
+    restrictionsOf(agent) { return scopeRestrictions(agent) },
     /** The context the last delegation created its child through: `'root'` or `'plugin'`. */
     get createdBy() { return createdBy },
   }
@@ -1866,6 +1939,24 @@ check('persona: a template without one contributes no persona section', async ()
   assert.equal(section, undefined, 'the deployment persona is left alone')
 })
 
+/**
+ * The restrictions a TEMPLATE contributed to the current child's scope.
+ *
+ * A child's scope also carries the row's depth cap, which denies the delegation
+ * tools under the default `maxDepth` of 1 and has nothing to do with any
+ * template. Probes about `toolFilter` ask what the template itself declared, so
+ * this drops the cap's deny rather than letting the row's policy answer for it.
+ * @param fake - the mounted fake Harness.
+ * @returns every restriction on the child scope that no template declared.
+ */
+function templateRestrictions(fake) {
+  const capDeny = ['subagent', 'list_subagent_templates']
+  const isCap = (filter) => filter.allow === undefined
+    && Array.isArray(filter.deny) && filter.deny.length === capDeny.length
+    && capDeny.every(name => filter.deny.includes(name))
+  return fake.created.filter(([what, value]) => what === 'restrict' && !isCap(value)).map(([, value]) => value)
+}
+
 check('toolFilter: a template restriction is applied to the child scope', async () => {
   const fake = await mount({
     config: { templates: [{ ...TEMPLATES[0], toolFilter: { deny: ['write'] } }] },
@@ -1879,7 +1970,10 @@ check('toolFilter: a template restriction is applied to the child scope', async 
 check('toolFilter: a template without one restricts nothing', async () => {
   const fake = await mount()
   await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
-  assert.equal(fake.created.find(([what]) => what === 'restrict'), undefined)
+  // Scoped to the TEMPLATE's own restrictions: the depth cap denies the delegation
+  // tools on this child's scope under the default maxDepth of 1, and that deny is
+  // the row's policy rather than anything this template declared.
+  assert.deepEqual(templateRestrictions(fake), [], 'a template without a filter contributes no restriction')
 })
 
 check('toolFilter: the row schema invents none, so a filterless template keeps the whole tool set', async () => {
@@ -1891,7 +1985,8 @@ check('toolFilter: the row schema invents none, so a filterless template keeps t
   const fake = await mount({ config: parsed })
   await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
   assert.equal(parsed.templates.get()[0].toolFilter, undefined, 'the schema left the absent filter absent')
-  assert.equal(fake.created.find(([what]) => what === 'restrict'), undefined)
+  assert.deepEqual(templateRestrictions(fake), [], 'no invented `allow: []` reached the child')
+  assert.equal(fake.childTools.has('ask_parent'), true, 'the child kept its own tool')
 })
 
 check('the row schema adds no key a template did not declare', () => {
@@ -1966,6 +2061,78 @@ check('maxDepth: provider-managed leaves the depth unbounded', async () => {
   })
   await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
   assert.equal(fake.storeRecords.size, 2, 'the delegation proceeded past the first level')
+})
+
+check('maxDepth: a child at the cap never receives the delegation tools', async () => {
+  const fake = await mount({ config: { templates: TEMPLATES, maxDepth: 1 } })
+  await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
+  // The refusal this replaces would have been a tool error on every turn, for a
+  // fact that cannot change. The child must not see the tools at all instead.
+  const visible = fake.visibleTools(fake.child)
+  assert.equal(visible.has('subagent'), false, 'the delegation tool is not injected at the cap')
+  assert.equal(visible.has('list_subagent_templates'), false, 'nor is the discovery tool that serves it')
+  assert.equal(fake.childTools.has('ask_parent'), true, "the child's own tool is untouched")
+  assert.equal(fake.visibleTools(fake.parent).has('subagent'), true, 'the session under the cap still delegates')
+})
+
+check('maxDepth: a child within the cap still receives the delegation tools', async () => {
+  const fake = await mount({ config: { templates: TEMPLATES, maxDepth: 2 } })
+  await delegate(fake, { name: 'x', template: 'medium', prompt: 'look' }, false)
+  const visible = fake.visibleTools(fake.child)
+  assert.equal(visible.has('subagent'), true, 'depth 1 of 2 leaves the child able to delegate')
+  assert.equal(visible.has('list_subagent_templates'), true)
+})
+
+check('maxDepth: a resumed session at the cap is denied from the recorded chain', async () => {
+  // A restart is the case the store exists for: nothing ran a delegating call in
+  // this process, so the depth can only come from the durable record.
+  const fake = await mount({
+    config: { templates: TEMPLATES, maxDepth: 1 },
+    coldStart: true,
+    shared: { storeRecords: new Map([['child-1', {
+      parentSessionId: 'parent-1',
+      name: 'mid',
+      templateId: 'medium',
+      createdAt: 1,
+      cwd: 'C:/work',
+    }]]) },
+    liveAgents: [{ id: 'child-1' }],
+  })
+  await until(() => fake.restrictionsOf(fake.agentsApi.get('child-1')).length > 0,
+    'the resumed child was reconciled against the recorded chain')
+  const visible = fake.visibleTools(fake.agentsApi.get('child-1'))
+  assert.equal(visible.has('subagent'), false, 'a depth-1 session cannot delegate at maxDepth 1')
+})
+
+check('maxDepth: raising the cap hands the tools back', async () => {
+  // `maxDepth` reaches a running row as a reference the Loader updates in place,
+  // so a probe that edits a plain object would be testing a path the host never
+  // takes — and the cap would never move at all.
+  const depth = { held: 1, get() { return this.held } }
+  const fake = await mount({
+    config: { templates: TEMPLATES, maxDepth: depth },
+    coldStart: true,
+    shared: { storeRecords: new Map([['child-1', {
+      parentSessionId: 'parent-1',
+      name: 'mid',
+      templateId: 'medium',
+      createdAt: 1,
+      cwd: 'C:/work',
+    }]]) },
+    liveAgents: [{ id: 'child-1' }],
+  })
+  const child = fake.agentsApi.get('child-1')
+  await until(() => fake.restrictionsOf(child).length > 0, 'the session starts withheld')
+  assert.equal(fake.visibleTools(child).has('subagent'), false)
+
+  // The deny must be reversible or a session that may delegate again would carry
+  // no tools at all, so raising the cap has to lift exactly the restriction it put
+  // in place.
+  depth.held = 2
+  fake.listeners.get('loader/volatile-update')([['maxDepth']])
+  await until(() => fake.visibleTools(child).has('subagent'),
+    'the raised cap restored the delegation tools')
+  assert.deepEqual(fake.restrictionsOf(child), [], 'the exact restriction was lifted')
 })
 
 check('a reload waits out the previous instance instead of adopting a domain it closes', async () => {
